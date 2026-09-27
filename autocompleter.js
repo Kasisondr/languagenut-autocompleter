@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LanguageNut Autocompleter (Jumble + MC + Fridge)
 // @namespace    languagenut-autocompleter
-// @version      9.5
+// @version      10.9
 // @description  Autocompletes LanguageNut vocab/sentence activities including WordPod, Skyrise and Concert Speaking
 // @author       You
 // @match        *://*.languagenut.com/*
@@ -67,8 +67,11 @@
     concertListenArmMs: 650,
     concertMicVerifyMs: 900,
     concertEvalWaitMs: 9000,
-    concertCycleWaitMs: 3000,
-    concertBetweenMicClicksMs: 950,
+    concertRetryDelayMs: 3000,
+    concertSecondClickDelayMs: 650,
+    concertPostTtsMs: 220,
+    concertEvalTimeoutMs: 12000,
+    concertEventSettleMs: 60,
     concertAfterSpeakMs: 900,
     concertTtsRate: 0.88,
     concertTtsPitch: 1,
@@ -121,6 +124,14 @@
     concertLastSpoken: '', concertFails: 0, concertSpeakButtonCache: null,
     concertEvalSerial: 0, concertEvalResult: null, concertEvalUrl: '',
     concertCycleQuestion: null, concertCycleCount: 0,
+    concertNavGuardLogged: false,
+    concertNavLockActive: false,
+    concertNavLockUrl: '',
+    concertNavLockHash: '',
+    concertNavLockRestoring: false,
+    concertCompleted: false,
+    concertHadQuestion: false,
+    examTranslations: [], examBusy: false, examSubmitted: new Set(),
     discordWebhook: '', webhookLastAnswered: 0, webhookSending: false,
     wordPopFails: 0, wordPopLastKey: null, wordPopBusy: false,
     wordPopAudioBusy: false, wordPopLastSignature: null,
@@ -282,6 +293,7 @@
   function isVocabUrl(u) { return typeof u === 'string' && u.indexOf('getVocabTranslations') !== -1; }
   function isSentenceUrl(u) { return typeof u === 'string' && u.indexOf('getSentenceTranslations') !== -1; }
   function isVerbUrl(u) { return typeof u === 'string' && u.indexOf('getVerbTranslations') !== -1; }
+  function isExamTranslationsUrl(u) { return typeof u === 'string' && /examTranslationController\/getExamTranslationsCorrect/i.test(u); }
   function isInterestingUrl(u) { return typeof u === 'string' && /vocab|verb|translation|homework|assignment|question|content|sentence/i.test(u); }
 
   function isConcertEvalUrl(u) {
@@ -388,6 +400,24 @@
       setVocabCount(state.vocab.length + state.sentences.length + state.verbs.length);
     } catch (e) { log('verb parse failed', e); }
   }
+  function ingestExamTranslations(body) {
+    try {
+      const data = typeof body === 'string' ? JSON.parse(body) : body;
+      if (!data || !Array.isArray(data.examTranslations)) return;
+      const parsed = data.examTranslations.map(entry => {
+        const xml = new DOMParser().parseFromString(String(entry.other || ''), 'text/xml');
+        return {
+          uid: String(entry.uid || ''),
+          question: String(xml.querySelector('question')?.textContent || '').trim(),
+          answer: String(xml.querySelector('correct')?.textContent || '').trim()
+        };
+      }).filter(entry => entry.question && entry.answer);
+      state.examTranslations = parsed;
+      state.examSubmitted = new Set();
+      addLog(`Exam answers loaded: ${parsed.length}`, 'ok');
+      setVocabCount(state.vocab.length + state.sentences.length + state.verbs.length + parsed.length);
+    } catch (e) { log('exam translation parse failed', e); }
+  }
   (function () { const orig = window.fetch; if (!orig) return;
     window.fetch = function (input) {
       const url = typeof input === 'string' ? input : (input && input.url);
@@ -396,6 +426,7 @@
       if (isVocabUrl(url)) p.then(r => r.clone().text().then(ingestVocab).catch(()=>{}));
       if (isSentenceUrl(url)) p.then(r => r.clone().text().then(ingestSentences).catch(()=>{}));
       if (isVerbUrl(url)) p.then(r => r.clone().text().then(ingestVerbs).catch(()=>{}));
+      if (isExamTranslationsUrl(url)) p.then(r => r.clone().text().then(ingestExamTranslations).catch(()=>{}));
       if (isConcertEvalUrl(url)) {
         p.then(r =>
           r.clone().text()
@@ -413,6 +444,7 @@
         if (isVocabUrl(this.__ln_url)) ingestVocab(this.responseText);
         if (isSentenceUrl(this.__ln_url)) ingestSentences(this.responseText);
         if (isVerbUrl(this.__ln_url)) ingestVerbs(this.responseText);
+        if (isExamTranslationsUrl(this.__ln_url)) ingestExamTranslations(this.responseText);
         if (isConcertEvalUrl(this.__ln_url)) {
           let raw = '';
           try {
@@ -618,6 +650,11 @@
   }
 
   function firePointerEvent(canvas, type, x, y, buttons) {
+    if (state.running && (isConcertRoute() || concertNavigationLocked())) {
+      log(`Concert firewall blocked generic ${type} @ ${Math.round(x)},${Math.round(y)}`);
+      return false;
+    }
+
     const ev = new PointerEvent(type, {
       bubbles: true, cancelable: true, composed: true, view: window,
       clientX: x, clientY: y, screenX: x, screenY: y,
@@ -625,9 +662,15 @@
       width: 1, height: 1, pressure: buttons ? 0.5 : 0
     });
     canvas.dispatchEvent(ev);
+    return true;
   }
 
   function fireClickAt(x, y, marker) {
+    if (state.running && (isConcertRoute() || concertNavigationLocked())) {
+      log(`Concert firewall blocked generic click @ ${Math.round(x)},${Math.round(y)}`);
+      return false;
+    }
+
     const c = state.pixiApp && state.pixiApp.view; if (!c) return false;
     if (marker) showClickMarker(x, y, marker);
     try {
@@ -755,12 +798,23 @@
     return r;
   }
 
+  function isConcertRoute() {
+    const u = String(location.href || '');
+    // The Concert speaking assignment actually runs at #/ZenPhonicsBand.
+    // The earlier route check missed it, allowing another game's click
+    // handler to run against the visible Assignments breadcrumb.
+    return /#\/(?:ZenPhonicsBand|ZenConcert|ConcertGame|Concert)(?:[/?]|$)/i.test(u) ||
+      /[?&]zenSourceController=PhonicsBand(?:[&#]|$)/i.test(u) ||
+      /[?&](?:game|activity)=concert(?:[&#]|$)/i.test(u);
+  }
+
   // ============ MODE ============
-  function modeLabel(m) { if (m === 'jumble') return 'Jumble'; if (m === 'mc-listening') return 'MC Listening'; if (m === 'mc-reading') return 'MC Reading'; if (m === 'mc2-listening') return 'Multiple Choice 2 Listening'; if (m === 'mc2-reading') return 'Multiple Choice 2 Reading'; if (m === 'wordpod-reading') return 'WordPod Reading'; if (m === 'wordpod-listening') return 'WordPod Listening'; if (m === 'skyrise') return 'Skyrise'; if (m === 'concert-speaking') return 'Concert Speaking'; if (m === 'wordpop-listening') return 'WordPop Listening'; if (m === 'ocean-cleaner') return 'Ocean Cleaner'; if (m === 'gapfill') return 'GapFill'; if (m === 'fridge') return 'Fridge / Sentence'; if (m === 'verb-matcher') return 'Verb Matcher'; if (m === 'jigsaw') return 'Jigsaw'; if (m === 'forklift') return 'Forklift'; return '—'; }
+  function modeLabel(m) { if (m === 'exam-open-reading') return 'Exam Open Reading'; if (m === 'jumble') return 'Jumble'; if (m === 'mc-listening') return 'MC Listening'; if (m === 'mc-reading') return 'MC Reading'; if (m === 'mc2-listening') return 'Multiple Choice 2 Listening'; if (m === 'mc2-reading') return 'Multiple Choice 2 Reading'; if (m === 'wordpod-reading') return 'WordPod Reading'; if (m === 'wordpod-listening') return 'WordPod Listening'; if (m === 'skyrise') return 'Skyrise'; if (m === 'concert-speaking') return 'Concert Speaking'; if (m === 'wordpop-listening') return 'WordPop Listening'; if (m === 'ocean-cleaner') return 'Ocean Cleaner'; if (m === 'gapfill') return 'GapFill'; if (m === 'fridge') return 'Fridge / Sentence'; if (m === 'verb-matcher') return 'Verb Matcher'; if (m === 'jigsaw') return 'Jigsaw'; if (m === 'forklift') return 'Forklift'; return '—'; }
   function detectMode() {
     const u = location.href;
 
     // Strong URL identifiers first.
+    if (/#\/alevelOpenReading(?:[/?]|$)/i.test(u)) return 'exam-open-reading';
     if (/\/ZenJumble\b/i.test(u)) return 'jumble';
     if (/\/ZenListening\b/i.test(u)) return 'mc-listening';
     if (/\/ZenReading\b/i.test(u)) return 'mc-reading';
@@ -777,7 +831,7 @@
 
     if (/SkyRise|Skyrise|skyRise|skyrise/i.test(u)) return 'skyrise';
 
-    if (/ZenConcert|ConcertGame|\/Concert\b|concert/i.test(u)) {
+    if (isConcertRoute()) {
       return 'concert-speaking';
     }
 
@@ -3611,6 +3665,574 @@
   }
 
 
+  function concertObjectText(obj) {
+    const parts = [];
+
+    walk(obj, (o) => {
+      if (typeof o.text === 'string' && o.text.trim()) {
+        parts.push(o.text.trim());
+      }
+
+      if (typeof o.name === 'string' && o.name.trim()) {
+        parts.push(o.name.trim());
+      }
+    });
+
+    return parts.join(' | ');
+  }
+
+  function concertIsForbiddenNavObject(obj) {
+    if (!obj) return false;
+
+    // Match the labelled object itself. Walking all descendants here marks
+    // the whole game stage as an Assignments button whenever one exists.
+    const hay = [obj.text, obj.name, obj.label]
+      .filter(value => typeof value === 'string')
+      .join(' ');
+
+    return /\b(assignments?|homework)\b/i.test(hay);
+  }
+
+  function concertInstallForbiddenNavGuard() {
+    const a = state.pixiApp;
+    if (!a || !a.stage) return 0;
+
+    let guarded = 0;
+
+    walk(a.stage, (o) => {
+      if (!o || concertIsForbiddenNavObject(o) !== true) return;
+
+      // Find the nearest object that actually owns navigation listeners.
+      let p = o;
+      let depth = 0;
+
+      while (p && depth < 6) {
+        const events = verbEventNames(p);
+
+        if (
+          events.includes('pointerup') ||
+          events.includes('click') ||
+          events.includes('tap') ||
+          events.includes('keyup')
+        ) {
+          if (!p.__lnAcForbiddenNavGuard) {
+            const originalEmit = p.emit;
+
+            if (typeof originalEmit === 'function') {
+              p.__lnAcForbiddenNavGuard = true;
+              p.__lnAcOriginalEmit = originalEmit;
+              p.__lnAcOriginalInteractive = p.interactive;
+              p.__lnAcOriginalEventMode = p.eventMode;
+              p.__lnAcOriginalButtonMode = p.buttonMode;
+              p.__lnAcOriginalCursor = p.cursor;
+
+              p.emit = function(type, ...args) {
+                // Restore this nav control once automation is stopped.
+                if (
+                  !state.running &&
+                  p.__lnAcForbiddenNavGuard &&
+                  p.__lnAcOriginalEmit
+                ) {
+                  const original = p.__lnAcOriginalEmit;
+
+                  try { p.emit = original; } catch (_) {}
+                  try { p.interactive = p.__lnAcOriginalInteractive; } catch (_) {}
+                  try { p.eventMode = p.__lnAcOriginalEventMode; } catch (_) {}
+                  try { p.buttonMode = p.__lnAcOriginalButtonMode; } catch (_) {}
+                  try { p.cursor = p.__lnAcOriginalCursor; } catch (_) {}
+
+                  try { delete p.__lnAcForbiddenNavGuard; } catch (_) {}
+                  try { delete p.__lnAcOriginalEmit; } catch (_) {}
+                  try { delete p.__lnAcOriginalInteractive; } catch (_) {}
+                  try { delete p.__lnAcOriginalEventMode; } catch (_) {}
+                  try { delete p.__lnAcOriginalButtonMode; } catch (_) {}
+                  try { delete p.__lnAcOriginalCursor; } catch (_) {}
+
+                  return original.call(this, type, ...args);
+                }
+
+                if (
+                  state.running &&
+                  /^(?:pointerup|click|tap|keyup)$/i.test(String(type || ''))
+                ) {
+                  log(
+                    `Concert firewall swallowed forbidden nav event: ` +
+                    `${String(type)} → ${concertObjectText(this)}`
+                  );
+                  return false;
+                }
+
+                return originalEmit.call(this, type, ...args);
+              };
+            }
+          }
+
+          // Also remove it from PIXI hit testing while Concert is active.
+          // The original emitter remains callable once automation stops.
+          try { p.interactive = false; } catch (_) {}
+          try { p.eventMode = 'none'; } catch (_) {}
+          try { p.buttonMode = false; } catch (_) {}
+          try { p.cursor = null; } catch (_) {}
+
+          guarded++;
+          break;
+        }
+
+        p = p.parent;
+        depth++;
+      }
+    });
+
+    return guarded;
+  }
+
+  // ============ CONCERT PAGE NAVIGATION LOCK ============
+  // Once a real Concert question is seen, keep the browser on that exact
+  // page until LanguageNut itself shows a genuine completion state.
+  function concertNavigationLocked() {
+    return !!(
+      state.running &&
+      state.concertNavLockActive &&
+      !state.concertCompleted
+    );
+  }
+
+  function concertEngageNavigationLock() {
+    if (!state.running) return false;
+    if (state.concertCompleted) return false;
+    if (state.concertNavLockActive) return true;
+
+    state.concertNavLockActive = true;
+    state.concertNavLockUrl = String(location.href || '');
+    state.concertNavLockHash = String(location.hash || '');
+    state.concertNavLockRestoring = false;
+
+    addLog(
+      `Concert navigation locked to ${state.concertNavLockHash || location.pathname}`,
+      'ok'
+    );
+
+    return true;
+  }
+
+  function concertReleaseNavigationLock(reason) {
+    const wasLocked = state.concertNavLockActive;
+
+    state.concertNavLockActive = false;
+    state.concertNavLockRestoring = false;
+
+    if (wasLocked) {
+      addLog(
+        `Concert navigation unlocked${reason ? `: ${reason}` : ''}`,
+        'ok'
+      );
+    }
+  }
+
+  function concertResolveUrl(url) {
+    try {
+      return new URL(String(url), location.href).href;
+    } catch (_) {
+      return String(url || '');
+    }
+  }
+
+  function concertNavigationWouldLeave(url) {
+    if (!concertNavigationLocked()) return false;
+
+    const locked = String(state.concertNavLockUrl || '');
+    if (!locked) return true;
+
+    if (url == null || url === '') {
+      return false;
+    }
+
+    return concertResolveUrl(url) !== locked;
+  }
+
+  function concertRestoreLockedLocation(source) {
+    if (!concertNavigationLocked()) return false;
+    if (state.concertNavLockRestoring) return true;
+
+    const lockedUrl = String(state.concertNavLockUrl || '');
+    const lockedHash = String(state.concertNavLockHash || '');
+
+    if (!lockedUrl || location.href === lockedUrl) return false;
+
+    state.concertNavLockRestoring = true;
+
+    log(
+      `Concert navigation firewall restoring page after ${source || 'navigation'}: ` +
+      `${location.href} → ${lockedUrl}`
+    );
+
+    try {
+      // Hash routing is what LanguageNut uses for Homework/Assignments.
+      // Setting the original hash makes the SPA route back through its own
+      // router instead of only repainting the address bar.
+      if (String(location.hash || '') !== lockedHash) {
+        location.hash = lockedHash;
+      } else if (
+        window.__lnAcConcertNavOriginals &&
+        typeof window.__lnAcConcertNavOriginals.replaceState === 'function'
+      ) {
+        window.__lnAcConcertNavOriginals.replaceState.call(
+          history,
+          history.state,
+          '',
+          lockedUrl
+        );
+      }
+    } catch (e) {
+      log('Concert navigation restore failed', e);
+    }
+
+    setTimeout(() => {
+      state.concertNavLockRestoring = false;
+    }, 0);
+
+    return true;
+  }
+
+  function concertInstallGlobalNavigationLock() {
+    if (window.__lnAcConcertNavigationLockInstalled) return;
+    window.__lnAcConcertNavigationLockInstalled = true;
+
+    const originals = {
+      pushState: history.pushState,
+      replaceState: history.replaceState,
+      back: history.back,
+      forward: history.forward,
+      go: history.go,
+      open: window.open
+    };
+
+    window.__lnAcConcertNavOriginals = originals;
+
+    history.pushState = function(stateArg, title, url) {
+      if (concertNavigationWouldLeave(url)) {
+        log(
+          `Concert navigation firewall blocked history.pushState → ${String(url)}`
+        );
+        return;
+      }
+
+      return originals.pushState.apply(this, arguments);
+    };
+
+    history.replaceState = function(stateArg, title, url) {
+      if (concertNavigationWouldLeave(url)) {
+        log(
+          `Concert navigation firewall blocked history.replaceState → ${String(url)}`
+        );
+        return;
+      }
+
+      return originals.replaceState.apply(this, arguments);
+    };
+
+    history.back = function() {
+      if (concertNavigationLocked()) {
+        log('Concert navigation firewall blocked history.back()');
+        return;
+      }
+
+      return originals.back.apply(this, arguments);
+    };
+
+    history.forward = function() {
+      if (concertNavigationLocked()) {
+        log('Concert navigation firewall blocked history.forward()');
+        return;
+      }
+
+      return originals.forward.apply(this, arguments);
+    };
+
+    history.go = function(delta) {
+      if (concertNavigationLocked()) {
+        log(`Concert navigation firewall blocked history.go(${String(delta)})`);
+        return;
+      }
+
+      return originals.go.apply(this, arguments);
+    };
+
+    try {
+      window.open = function(url) {
+        if (concertNavigationLocked()) {
+          log(
+            `Concert navigation firewall blocked window.open → ${String(url || '')}`
+          );
+          return null;
+        }
+
+        return originals.open.apply(this, arguments);
+      };
+    } catch (_) {}
+
+    // Block ordinary DOM navigation before the app sees it.
+    document.addEventListener('click', (e) => {
+      if (!concertNavigationLocked()) return;
+
+      const el = e.target instanceof Element
+        ? e.target.closest('a,button,[role="button"]')
+        : null;
+
+      if (!el) return;
+
+      const text = String(
+        el.innerText ||
+        el.textContent ||
+        el.getAttribute('aria-label') ||
+        el.getAttribute('title') ||
+        ''
+      );
+
+      let leaving = /\b(assignments?|homework|home|exit|back)\b/i.test(text);
+
+      if (el.tagName === 'A') {
+        const href = el.getAttribute('href');
+
+        if (href && concertNavigationWouldLeave(href)) {
+          leaving = true;
+        }
+      }
+
+      if (!leaving) return;
+
+      e.stopImmediatePropagation();
+      e.stopPropagation();
+
+      try {
+        if (e.cancelable) e.preventDefault();
+      } catch (_) {}
+
+      log(
+        `Concert navigation firewall blocked DOM navigation: ` +
+        `${text.trim() || el.tagName}`
+      );
+    }, true);
+
+    // Stop forms from navigating away while a question set is unfinished.
+    document.addEventListener('submit', (e) => {
+      if (!concertNavigationLocked()) return;
+
+      e.stopImmediatePropagation();
+      e.stopPropagation();
+
+      try {
+        if (e.cancelable) e.preventDefault();
+      } catch (_) {}
+
+      log('Concert navigation firewall blocked form submit');
+    }, true);
+
+    // Direct `location.hash = "#/Homework"` cannot be monkey-patched
+    // reliably. Catch the resulting route change immediately and restore the
+    // remembered Concert hash.
+    window.addEventListener('hashchange', () => {
+      if (!concertNavigationLocked()) return;
+
+      if (location.href !== state.concertNavLockUrl) {
+        concertRestoreLockedLocation('hashchange');
+      }
+    }, true);
+
+    window.addEventListener('popstate', () => {
+      if (!concertNavigationLocked()) return;
+
+      if (location.href !== state.concertNavLockUrl) {
+        concertRestoreLockedLocation('popstate');
+      }
+    }, true);
+
+    // Last line of defence for full-page navigation/reload attempts.
+    window.addEventListener('beforeunload', (e) => {
+      if (!concertNavigationLocked()) return;
+
+      try {
+        e.preventDefault();
+        e.returnValue = '';
+      } catch (_) {}
+
+      return '';
+    }, true);
+  }
+
+  // ============ CONCERT GLOBAL CANVAS BLOCKER ============
+  // Capture-phase listener that runs BEFORE PIXI sees the event.
+  // Works even if LanguageNut recreates the Assignments/Homework button
+  // after the URL changes to #/Homework on the results screen.
+  function concertInstallGlobalCanvasBlocker() {
+    if (window.__lnAcConcertBlockerInstalled) return;
+    window.__lnAcConcertBlockerInstalled = true;
+
+    const blockEvent = (e) => {
+      if (!concertNavigationLocked()) return;
+
+      const a = state.pixiApp;
+      if (!a || !a.view) return;
+
+      // Only block events whose target is the PIXI canvas.
+      if (e.target !== a.view && !a.view.contains(e.target)) return;
+
+      const rect = a.view.getBoundingClientRect();
+      const res = (a.renderer && a.renderer.resolution) || 1;
+      const lw = (a.renderer.width || a.view.width) / res;
+      const lh = (a.renderer.height || a.view.height) / res;
+
+      if (!rect.width || !rect.height || !lw || !lh) return;
+
+      const px = (e.clientX - rect.left) / (rect.width / lw);
+      const py = (e.clientY - rect.top) / (rect.height / lh);
+
+      let hit = false;
+
+      walk(a.stage, (o) => {
+        if (hit) return;
+        if (!concertIsForbiddenNavObject(o)) return;
+        if (!isVisible(o, a.stage)) return;
+
+        // Text bounds cover only the label. The actual interactive parent is
+        // larger, so a click on its padding can still navigate away.
+        let control = o;
+        let parent = o.parent;
+        let depth = 0;
+        while (parent && parent !== a.stage && depth < 6) {
+          const events = verbEventNames(parent);
+          if (events.some(name => /^(?:pointerdown|pointerup|click|tap|mouseup|touchend)$/i.test(name))) {
+            control = parent;
+            break;
+          }
+          parent = parent.parent;
+          depth++;
+        }
+
+        const b = boundsOf(control);
+        if (!b || b.width <= 0 || b.height <= 0) return;
+
+        // Pad a few pixels so edges still block.
+        if (
+          px >= b.x - 3 &&
+          px <= b.x + b.width + 3 &&
+          py >= b.y - 3 &&
+          py <= b.y + b.height + 3
+        ) {
+          hit = true;
+        }
+      });
+
+      if (hit) {
+        e.stopImmediatePropagation();
+        e.stopPropagation();
+
+        try {
+          if (e.cancelable) e.preventDefault();
+        } catch (_) {}
+
+        log(
+          'Concert firewall blocked Assignments/Homework click ' +
+          '(capture phase)'
+        );
+
+        return false;
+      }
+    };
+
+    // Capture phase (third arg = true) so this fires BEFORE PIXI's own
+    // listeners registered on the same canvas.
+    for (const type of [
+      'pointerdown', 'pointerup',
+      'mousedown', 'mouseup',
+      'click', 'tap',
+      'touchstart', 'touchend'
+    ]) {
+      document.addEventListener(type, blockEvent, true);
+    }
+  }
+
+
+
+  function concertRestoreForbiddenNavGuards() {
+    const a = state.pixiApp;
+    if (!a || !a.stage) return 0;
+
+    let restored = 0;
+
+    walk(a.stage, (p) => {
+      if (
+        !p ||
+        !p.__lnAcForbiddenNavGuard ||
+        !p.__lnAcOriginalEmit
+      ) return;
+
+      try { p.emit = p.__lnAcOriginalEmit; } catch (_) {}
+      try { p.interactive = p.__lnAcOriginalInteractive; } catch (_) {}
+      try { p.eventMode = p.__lnAcOriginalEventMode; } catch (_) {}
+      try { p.buttonMode = p.__lnAcOriginalButtonMode; } catch (_) {}
+      try { p.cursor = p.__lnAcOriginalCursor; } catch (_) {}
+
+      try { delete p.__lnAcForbiddenNavGuard; } catch (_) {}
+      try { delete p.__lnAcOriginalEmit; } catch (_) {}
+      try { delete p.__lnAcOriginalInteractive; } catch (_) {}
+      try { delete p.__lnAcOriginalEventMode; } catch (_) {}
+      try { delete p.__lnAcOriginalButtonMode; } catch (_) {}
+      try { delete p.__lnAcOriginalCursor; } catch (_) {}
+
+      restored++;
+    });
+
+    return restored;
+  }
+
+  function concertHasActiveQuestion() {
+    if (!state.pixiApp || !state.pixiApp.stage) return false;
+
+    const prompts = concertCollectPrompts();
+    if (!prompts.length) return false;
+
+    // A genuine active Concert round has both a visible vocab prompt and the
+    // confirmed record/mic control. This prevents generic score text such as
+    // "15/15" from being mistaken for final completion.
+    const mic = concertFindExactRecordButton();
+
+    return !!(
+      mic &&
+      mic.obj &&
+      mic.micCircle &&
+      isVisible(mic.obj, state.pixiApp.stage)
+    );
+  }
+
+  function concertCanUnlockForCompletion(doneText) {
+    if (!state.concertHadQuestion) return false;
+
+    // A microphone may briefly disappear while recording or evaluating. A
+    // visible vocabulary prompt alone is enough to keep navigation locked.
+    if (concertCollectPrompts().length || concertHasActiveQuestion()) {
+      return false;
+    }
+
+    const d = String(doneText || '');
+
+    // For Concert, generic n/n score text alone is not enough to unlock.
+    // Require either an explicit completion phrase/result route, or no active
+    // prompt plus a known results/summary route.
+    if (/[#/](?:results?|review|complete|summary)\b/i.test(location.href)) {
+      return true;
+    }
+
+    if (
+      /\b(?:activity|homework|exercise|quiz)\s+(?:is\s+)?(?:complete|completed|finished|done)\b/i.test(d) ||
+      /\b(?:well done|great job|amazing work|excellent work|all correct|all right)\b/i.test(d)
+    ) {
+      return true;
+    }
+
+    return false;
+  }
+
   // ============ CONCERT SPEAKING ============
   function concertVisible(el) {
     if (!(el instanceof Element)) return false;
@@ -3840,7 +4462,8 @@
         b.height > 120
       ) return;
 
-      let hasMicChild = false;
+      let micTarget = null;
+      let micCircle = null;
       let micTexture = '';
 
       walk(o, (c) => {
@@ -3851,20 +4474,30 @@
 
         if (
           cn === 'mic' ||
-          cn === 'micCircle' ||
           /phonics\/games\/band\/mic\.svg/i.test(f)
         ) {
-          hasMicChild = true;
+          micTarget = c;
           if (f) micTexture = f;
+        }
+
+        if (cn === 'micCircle') {
+          micCircle = c;
         }
       });
 
-      if (!hasMicChild) return;
+      // Real manual pointerup capture showed target=micCircle,
+      // currentTarget=record. Prefer that exact child.
+      const target = micCircle || micTarget;
+      if (!target) return;
 
       exact = {
         kind: 'pixi-exact-record',
         obj: o,
+        target,
+        micSprite: micTarget,
+        micCircle,
         bounds: b,
+        targetBounds: boundsOf(target),
         events,
         text: 'record',
         texture: micTexture,
@@ -4183,49 +4816,170 @@
     };
   }
 
+
+  function concertMakeRecordEvent(button, type) {
+    const record = button && button.obj;
+    const target =
+      (button && button.micCircle) ||
+      (button && button.target) ||
+      record;
+
+    const tb =
+      boundsOf(target) ||
+      (button && button.targetBounds) ||
+      (button && button.bounds) ||
+      boundsOf(record);
+
+    // The captured real event landed at roughly 14% across and 56% down the
+    // 69x69 micCircle. Use the same relative point instead of the sprite centre.
+    const global = {
+      x: tb ? tb.x + tb.width * 0.14 : 0,
+      y: tb ? tb.y + tb.height * 0.56 : 0
+    };
+
+    const nativeEvent = {
+      type,
+      clientX: global.x,
+      clientY: global.y,
+      pageX: global.x,
+      pageY: global.y,
+      screenX: global.x,
+      // Captured browser event had screenY offset by ~151 px.
+      screenY: global.y + 151,
+      button: 0,
+      buttons: 0,
+      pointerId: 1,
+      pointerType: 'mouse',
+      isPrimary: true,
+      detail: 0,
+      preventDefault() {},
+      stopPropagation() {},
+      stopImmediatePropagation() {}
+    };
+
+    const path = [];
+    let p = target;
+    while (p) {
+      path.push(p);
+      if (p === record) break;
+      p = p.parent;
+    }
+
+    const e = {
+      type,
+
+      // Captured FederatedPointerEvent flags.
+      bubbles: true,
+      cancelBubble: true,
+      cancelable: false,
+      composed: false,
+      defaultPrevented: false,
+
+      target,
+      currentTarget: record,
+
+      global: { x: global.x, y: global.y },
+      client: { x: global.x, y: global.y },
+      page: { x: global.x, y: global.y },
+      screen: { x: global.x, y: global.y + 151 },
+      offset: { x: 0, y: 0 },
+      movement: { x: 0, y: 0 },
+
+      button: 0,
+      buttons: 0,
+      pointerId: 1,
+      pointerType: 'mouse',
+      isPrimary: true,
+      detail: 0,
+      eventPhase: 2,
+
+      nativeEvent,
+      originalEvent: nativeEvent,
+
+      data: {
+        global: { x: global.x, y: global.y },
+        button: 0,
+        buttons: 0,
+        pointerId: 1,
+        pointerType: 'mouse',
+        originalEvent: nativeEvent,
+        getLocalPosition(container, point) {
+          try {
+            if (
+              container &&
+              container.worldTransform &&
+              typeof container.worldTransform.applyInverse === 'function'
+            ) {
+              return container.worldTransform.applyInverse(
+                global,
+                point || {}
+              );
+            }
+          } catch (_) {}
+
+          const out = point || {};
+          out.x = global.x;
+          out.y = global.y;
+          return out;
+        }
+      },
+
+      composedPath() {
+        return path.slice();
+      },
+
+      preventDefault() {},
+      stopPropagation() {
+        this.cancelBubble = true;
+      },
+      stopImmediatePropagation() {
+        this.cancelBubble = true;
+      }
+    };
+
+    return e;
+  }
+
   async function concertClickSpeak(button) {
     if (
       !button ||
       !button.obj ||
+      !button.micCircle ||
       button.kind !== 'pixi-exact-record'
     ) {
       return false;
     }
 
-    const obj = button.obj;
+    const record = button.obj;
 
-    try {
-      // Exact object from the click dump:
-      // Container name="record", with its own pointerup handler.
-      // Calling the object directly avoids browser/canvas coordinates entirely,
-      // so it cannot accidentally hit Back/Home/Assignments.
-      if (typeof obj.emit === 'function') {
-        if ((button.events || []).includes('pointerover')) {
-          try {
-            obj.emit(
-              'pointerover',
-              makeVerbEvent(obj, 'pointerover')
-            );
-          } catch (_) {}
-        }
-
-        obj.emit(
-          'pointerup',
-          makeVerbEvent(obj, 'pointerup')
-        );
-
-        return true;
-      }
-    } catch (e) {
-      log('Concert exact record emit failed', e);
+    // Extra safety: never dispatch if this exact object is no longer visible.
+    if (!state.pixiApp || !isVisible(record, state.pixiApp.stage)) {
+      return false;
     }
 
-    return false;
+    try {
+      const event = concertMakeRecordEvent(button, 'pointerup');
+
+      // This is deliberately NOT a browser/canvas click. Calling the confirmed
+      // record listener directly means a result-screen "Assignments" button
+      // can never receive this interaction even if it occupies the same pixels.
+      record.emit('pointerup', event);
+
+      addLog(
+        `Concert mic event → target=${event.target && event.target.name || '?'} ` +
+        `currentTarget=${event.currentTarget && event.currentTarget.name || '?'}`
+      );
+
+      await sleep(CONFIG.concertEventSettleMs);
+      return true;
+    } catch (e) {
+      log('Concert direct mic event failed', e);
+      return false;
+    }
   }
 
-
   async function concertWaitForEvaluation(afterSerial) {
-    const end = Date.now() + CONFIG.concertEvalWaitMs;
+    const end = Date.now() + CONFIG.concertEvalTimeoutMs;
 
     while (Date.now() < end) {
       if (
@@ -4258,6 +5012,48 @@
       voices.find(v => String(v.lang || '').toLowerCase().startsWith(base + '-')) ||
       null
     );
+  }
+
+
+  function concertPromptLanguage(promptText) {
+    const p = normaliseText(promptText);
+    if (!p) return CONFIG.concertDefaultTargetLang;
+
+    for (const entry of state.vocab) {
+      const targetVals = [
+        entry.word,
+        entry.translatedWord,
+        entry.translation,
+        entry.translated
+      ];
+
+      for (const v of targetVals) {
+        if (
+          typeof v === 'string' &&
+          normaliseText(v) === p
+        ) {
+          return CONFIG.concertDefaultTargetLang;
+        }
+      }
+
+      const sourceVals = [
+        entry.originalWord,
+        entry.original
+      ];
+
+      for (const v of sourceVals) {
+        if (
+          typeof v === 'string' &&
+          normaliseText(v) === p
+        ) {
+          return 'en-GB';
+        }
+      }
+    }
+
+    // Concert evaluateAudio has been observed sending the visible German
+    // phrase itself, so target language is the safest fallback.
+    return CONFIG.concertDefaultTargetLang;
   }
 
   function concertSpeakTTS(text, lang) {
@@ -4311,7 +5107,7 @@
       const timeout =
         Math.max(3500, Math.min(12000, phrase.length * 220));
 
-      setTimeout(() => done(true, 'timeout fallback'), timeout);
+      setTimeout(() => done(false, 'TTS end timeout'), timeout);
     });
   }
 
@@ -4326,6 +5122,10 @@
     state.concertEvalUrl = '';
     state.concertCycleQuestion = null;
     state.concertCycleCount = 0;
+    state.concertNavGuardLogged = false;
+    state.concertHadQuestion = false;
+    state.concertCompleted = false;
+    concertReleaseNavigationLock('reset');
 
     try {
       if ('speechSynthesis' in window) {
@@ -4337,6 +5137,24 @@
   }
 
   async function concertSpeakingTick() {
+    // Re-arm guards because LanguageNut can recreate navigation controls.
+    concertInstallForbiddenNavGuard();
+
+    if (!isConcertRoute()) {
+      if (concertNavigationLocked()) {
+        concertRestoreLockedLocation('concert tick');
+        setStatus('Concert Speaking: restoring Concert page');
+        return;
+      }
+
+      setStatus('Concert Speaking: not on Concert page');
+      return;
+    }
+
+    // Arm before prompt and vocabulary detection. During loading and question
+    // transitions, neither is guaranteed to be present yet.
+    concertEngageNavigationLock();
+
     if (!state.vocab.length) {
       setStatus('Concert Speaking: waiting for vocab');
       return;
@@ -4344,8 +5162,9 @@
 
     const prompts = concertCollectPrompts();
 
+    // No active prompt = transition/results. Do absolutely nothing here.
     if (!prompts.length) {
-      setStatus('Concert Speaking: waiting for prompt');
+      setStatus('Concert Speaking: no active prompt — waiting');
       return;
     }
 
@@ -4353,60 +5172,62 @@
     const questionKey = prompt.norm;
     const spokenText = String(prompt.label || '').trim();
 
+    if (!spokenText) {
+      setStatus('Concert Speaking: empty prompt');
+      return;
+    }
+
+    state.concertHadQuestion = true;
+
     setPromptLabel(prompt.label);
 
-    if (!spokenText) {
-      state.concertFails++;
-      setStatus('Concert Speaking: empty prompt');
+    if (state.concertLockedQuestion === questionKey) {
+      setStatus('Concert Speaking: correct — waiting for next prompt');
       return;
     }
 
     if (state.concertCycleQuestion !== questionKey) {
       state.concertCycleQuestion = questionKey;
       state.concertCycleCount = 0;
-      state.concertLockedQuestion = null;
       state.concertFails = 0;
     }
 
     const mic = concertFindExactRecordButton();
 
-    if (!mic) {
-      state.concertFails++;
-      setStatus('Concert Speaking: exact record mic not found');
+    if (!mic || !mic.obj || !mic.micCircle) {
+      setStatus('Concert Speaking: active prompt, waiting for mic');
       return;
     }
 
-    state.concertLockedQuestion = questionKey;
+    state.concertCycleCount++;
     state.concertLastPrompt = prompt.label;
     state.concertLastSpoken = spokenText;
-    state.concertCycleCount++;
+
+    const lang = concertPromptLanguage(spokenText);
+    const evalBefore = state.concertEvalSerial;
 
     addLog(
-      `Concert cycle ${state.concertCycleCount}: "${spokenText}"`,
+      `Concert ${state.concertCycleCount}: "${spokenText}" (${lang})`,
       'ok'
     );
 
-    const evalBefore = state.concertEvalSerial;
+    // Start recording before speaking.
+    setStatus('Concert Speaking: starting microphone');
 
-    // 1) Start AudioRecognitionV2.
-    const started = await concertClickSpeak(mic);
-
-    if (!started) {
+    if (!(await concertClickSpeak(mic))) {
       state.concertFails++;
-      addLog('Concert: first exact record activation failed', 'err');
-      setStatus('Concert Speaking: mic start failed');
-      await sleep(CONFIG.concertCycleWaitMs);
+      addLog('Concert: microphone start failed', 'err');
+      setStatus('Concert Speaking: microphone start failed');
+      await sleep(CONFIG.concertRetryDelayMs);
       return;
     }
 
-    setStatus('Concert Speaking: recording');
     await sleep(CONFIG.concertListenArmMs);
 
-    // 2) Speak exactly the visible phrase.
-    const tts = await concertSpeakTTS(
-      spokenText,
-      CONFIG.concertDefaultTargetLang
-    );
+    // Speak exactly the visible Concert phrase.
+    setStatus(`Concert Speaking: saying "${spokenText}"`);
+
+    const tts = await concertSpeakTTS(spokenText, lang);
 
     if (!tts.ok) {
       state.concertFails++;
@@ -4415,68 +5236,126 @@
         'err'
       );
       setStatus('Concert Speaking: TTS failed');
-
-      // Attempt to close recording before the next retry.
-      await sleep(CONFIG.concertBetweenMicClicksMs);
-      await concertClickSpeak(mic);
-      await sleep(CONFIG.concertCycleWaitMs);
+      await sleep(CONFIG.concertRetryDelayMs);
       return;
     }
 
     addLog(`✓ Concert TTS "${spokenText}"`, 'ok');
 
-    // 3) Click the SAME exact record container again to end the recording.
-    await sleep(CONFIG.concertBetweenMicClicksMs);
+    // The game asks for a second microphone press when speech is finished.
+    // Recheck the live question before pressing: the game may have already
+    // evaluated it and replaced the record control during the TTS delay.
+    await sleep(CONFIG.concertSecondClickDelayMs);
 
-    const stopped = await concertClickSpeak(mic);
+    if (!state.running) return;
 
-    if (!stopped) {
-      state.concertFails++;
-      addLog('Concert: second exact record activation failed', 'err');
-      setStatus('Concert Speaking: mic stop failed');
-      await sleep(CONFIG.concertCycleWaitMs);
-      return;
+    const livePrompts = concertCollectPrompts();
+    const sameQuestion = livePrompts.length &&
+      livePrompts[0].norm === questionKey;
+    const alert = document.getElementById('hiddenAlertContainer');
+    const alertText = String(alert && alert.textContent || '');
+    const recordingNotEnded =
+      !/evaluat|\b(?:in)?correct\b|recording\s+(?:stopped|finished)/i.test(alertText);
+
+    if (
+      isConcertRoute() &&
+      sameQuestion &&
+      state.concertEvalSerial === evalBefore &&
+      recordingNotEnded
+    ) {
+      const stopMic = concertFindExactRecordButton();
+      setStatus('Concert Speaking: stopping microphone');
+
+      if (stopMic && await concertClickSpeak(stopMic)) {
+        addLog('Concert: microphone pressed again after speech', 'ok');
+      } else {
+        addLog('Concert: could not stop microphone', 'err');
+      }
+    } else {
+      addLog('Concert: second microphone press skipped; recording already ended');
     }
 
-    setStatus('Concert Speaking: waiting for evaluation');
+    setStatus('Concert Speaking: waiting for evaluateAudio');
+    addLog('Concert: waiting for evaluateAudio');
 
-    // Observe LanguageNut's genuine recognition response.
     const evaluation = await concertWaitForEvaluation(evalBefore);
 
-    if (evaluation && evaluation.isCorrect === true) {
-      addLog('✓ Concert recognition accepted', 'ok');
-      state.concertFails = 0;
-
-      await sleep(CONFIG.concertCycleWaitMs);
-
-      const after = concertCollectPrompts();
-      const afterKey = after.length ? after[0].norm : '';
-
-      if (afterKey && afterKey !== questionKey) {
-        state.answeredCount++;
-        setAnsweredCount(state.answeredCount);
-        state.concertLockedQuestion = null;
-        state.concertCycleQuestion = afterKey;
-        state.concertCycleCount = 0;
-        setStatus('Concert Speaking: answered');
-        return;
-      }
-
-      setStatus('Concert Speaking: correct — waiting for next question');
+    if (!evaluation) {
+      state.concertFails++;
+      addLog('Concert: evaluateAudio timeout — retrying in 3s', 'err');
+      setStatus('Concert Speaking: evaluateAudio timeout');
+      await sleep(CONFIG.concertRetryDelayMs);
       return;
     }
 
-    if (evaluation && evaluation.isCorrect === false) {
-      addLog('Concert recognition rejected — retrying in 3s', 'err');
-      state.concertFails++;
-    } else {
-      addLog('Concert: no finished evaluation — retrying in 3s');
-      state.concertFails++;
+    addLog(
+      `Concert: evaluateAudio complete ` +
+      `(isCorrect=${String(evaluation.isCorrect)})`,
+      evaluation.isCorrect === false ? 'err' : 'ok'
+    );
+
+    if (evaluation.isCorrect === true) {
+      state.concertLockedQuestion = questionKey;
+      state.concertFails = 0;
+      addLog(
+        'Concert: accepted. Navigation remains locked until this prompt disappears.',
+        'ok'
+      );
+      setStatus('Concert Speaking: correct — waiting for next prompt');
+
+      const end = Date.now() + 15000;
+
+      while (state.running && Date.now() < end) {
+        // If a bad navigation happens while the old question is transitioning,
+        // immediately route back.
+        if (!isConcertRoute() && concertNavigationLocked()) {
+          concertRestoreLockedLocation('post-answer wait');
+          await sleep(100);
+          continue;
+        }
+
+        const nextPrompts = concertCollectPrompts();
+
+        if (
+          nextPrompts.length &&
+          nextPrompts[0].norm &&
+          nextPrompts[0].norm !== questionKey
+        ) {
+          state.answeredCount++;
+          setAnsweredCount(state.answeredCount);
+          state.concertLockedQuestion = null;
+          state.concertCycleQuestion = nextPrompts[0].norm;
+          state.concertCycleCount = 0;
+          setStatus('Concert Speaking: next prompt ready');
+          return;
+        }
+
+        // If the same prompt is still visible, navigation MUST remain locked.
+        if (
+          nextPrompts.length &&
+          nextPrompts[0].norm === questionKey
+        ) {
+          concertEngageNavigationLock();
+        }
+
+        await sleep(150);
+      }
+
+      setStatus('Concert Speaking: waiting for game transition');
+      return;
     }
 
-    // Repeat until LanguageNut advances/completes, or the user presses Stop.
-    setStatus('Concert Speaking: retrying in 3s');
-    await sleep(CONFIG.concertCycleWaitMs);
+    state.concertFails++;
+
+    if (evaluation.isCorrect === false) {
+      addLog('Concert: incorrect — retrying in 3s', 'err');
+      setStatus('Concert Speaking: incorrect — retrying in 3s');
+    } else {
+      addLog('Concert: unknown evaluation — retrying in 3s', 'err');
+      setStatus('Concert Speaking: unknown result — retrying in 3s');
+    }
+
+    await sleep(CONFIG.concertRetryDelayMs);
   }
 
 
@@ -6487,8 +7366,24 @@
     if (!candidate) return false;
 
     if (candidate.source === 'dom') {
+      if (state.running && isConcertRoute()) {
+        log('Concert firewall blocked WordPop DOM click');
+        return false;
+      }
+
       const el = candidate.element;
       if (!el || !el.isConnected) return false;
+
+      if (
+        state.running &&
+        isConcertRoute() &&
+        /\b(assignments?|homework)\b/i.test(
+          String(el.innerText || el.textContent || '')
+        )
+      ) {
+        log('Concert firewall blocked Assignments/Homework DOM click');
+        return false;
+      }
 
       addLog(`WordPop DOM click "${candidate.label}"`);
 
@@ -6735,21 +7630,10 @@
       }
 
       if (m === 'concert-speaking') {
-      if (state.concertBusy) return;
-
-      state.concertBusy = true;
-      try {
-        await concertSpeakingTick();
-      } catch (e) {
-        const msg = e && e.message ? e.message : String(e);
-        addLog(`Concert Speaking runtime error: ${msg}`, 'err');
-        setStatus('Concert Speaking: runtime error');
-        log('Concert Speaking runtime error', e);
-      } finally {
-        state.concertBusy = false;
-      }
-      return;
+      setStatus('Concert handled by main dispatcher');
+      return false;
     }
+
 
     if (m === 'skyrise') {
       if (state.skyRiseBusy) return;
@@ -9033,12 +9917,126 @@
     await sleep(50);
   }
 
+  // ============ OPEN READING EXAM ============
+  function examCurrentEntry() {
+    const a = state.pixiApp;
+    if (!a || !state.examTranslations.length) return null;
+
+    let match = null;
+    walk(a.stage, o => {
+      if (match || typeof o.text !== 'string' || !isVisible(o, a.stage)) return;
+      const shown = normaliseText(o.text);
+      if (!shown) return;
+      const b = boundsOf(o);
+      if (!b || b.width < 10 || b.height < 10) return;
+      match = state.examTranslations.find(entry =>
+        normaliseText(entry.question) === shown
+      ) || null;
+    });
+    return match;
+  }
+
+  function examInput() {
+    const input = document.getElementById('textInputChina');
+    if (!(input instanceof HTMLTextAreaElement)) return null;
+    const b = input.getBoundingClientRect();
+    return b.width > 0 && b.height > 0 ? input : null;
+  }
+
+  function examSubmitControl() {
+    const a = state.pixiApp;
+    if (!a) return null;
+    let found = null;
+    walk(a.stage, o => {
+      if (found || o.text !== 'Submit' || !isVisible(o, a.stage)) return;
+      // The open-reading page uses correctButtonBackground for Submit. Its
+      // pointerup handler is on the label's parent, not on the sprite.
+      const target = o.parent;
+      if (!target || !isVisible(target, a.stage)) return;
+      if (!verbEventNames(target).some(name => /^(?:pointerup|click|tap)$/i.test(name))) return;
+      const bounds = boundsOf(target);
+      if (bounds && bounds.width > 30 && bounds.height > 20) found = {obj: target, bounds};
+    });
+    return found;
+  }
+
+  async function examOpenReadingTick() {
+    if (!state.examTranslations.length) {
+      setStatus('Exam: waiting for answers');
+      return;
+    }
+    const entry = examCurrentEntry();
+    if (!entry) {
+      setStatus('Exam: waiting for question');
+      return;
+    }
+    setPromptLabel(entry.question);
+    if (state.examSubmitted.has(entry.uid)) {
+      setStatus('Exam: submitted — waiting for next question');
+      return;
+    }
+
+    const input = examInput();
+    const submit = examSubmitControl();
+    if (!input || !submit) {
+      setStatus('Exam: waiting for answer controls');
+      return;
+    }
+
+    input.focus();
+    const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
+    if (setter) setter.call(input, entry.answer);
+    else input.value = entry.answer;
+    input.dispatchEvent(new InputEvent('input', {
+      bubbles: true, inputType: 'insertText', data: entry.answer
+    }));
+    input.dispatchEvent(new Event('change', {bubbles: true}));
+
+    if (input.value !== entry.answer) {
+      setStatus('Exam: answer input failed');
+      return;
+    }
+
+    // Click the visible Submit control, identified by its label and handler.
+    const b = submit.bounds;
+    const clicked = await safeCanvasPointerClickWorld(
+      b.x + b.width / 2, b.y + b.height / 2, '#4ade80', 250
+    );
+    if (!clicked) {
+      setStatus('Exam: submit click failed');
+      return;
+    }
+    state.examSubmitted.add(entry.uid);
+    state.answeredCount++;
+    setAnsweredCount(state.answeredCount);
+    addLog(`Exam submitted question ${entry.uid}`, 'ok');
+    setStatus('Exam: submitted — waiting for next question');
+  }
+
   // ============ MAIN ============
   async function tick() {
     if (!state.running) return;
     if (!tryGrabPixi()) { setStatus('Waiting for Pixi…'); return; }
     applyUserOptions();
-    const m = detectMode();
+
+    // Concert is exclusive. While its route is active, never let scene
+    // heuristics reinterpret completion/result UI as another game.
+    const m = (isConcertRoute() || concertNavigationLocked())
+      ? 'concert-speaking'
+      : detectMode();
+
+    if (m === 'concert-speaking' || concertNavigationLocked()) {
+      if (isConcertRoute()) concertEngageNavigationLock();
+      const blocked = concertInstallForbiddenNavGuard();
+
+      if (blocked > 0 && !state.concertNavGuardLogged) {
+        state.concertNavGuardLogged = true;
+        addLog(
+          `Concert firewall armed: ${blocked} Assignments/Homework control(s) blocked`,
+          'ok'
+        );
+      }
+    }
     if (m !== state.mode) {
       state.mode = m;
       setModeLabel(modeLabel(m));
@@ -9057,6 +10055,9 @@
         );
         if (m === 'skyrise') addLog(
           `Skyrise mode: DOM input`
+        );
+        if (m === 'exam-open-reading') addLog(
+          `Exam Open Reading: exact question and submit controls`
         );
         if (m === 'concert-speaking') addLog(
           `Concert Speaking: press Speak → TTS (${CONFIG.concertDefaultTargetLang})`
@@ -9081,21 +10082,95 @@
     }
     const done = detectCompletion();
     if (done) {
-      state.completionSeen = done;
-      addLog(`✓ Complete: "${done}"`, 'ok');
-      setStatus('Complete');
-      notifyDiscord(
-        'Activity completed',
-        `Answered counter: ${state.answeredCount}`
-      );
-      state.running = false;
-      const b = document.getElementById('ln-ac-toggle');
-      if (b) {
-        b.textContent = 'Start';
-        b.classList.remove('active');
+      // Concert has stricter completion rules. Generic score/progress text
+      // MUST NOT release the page lock while a real prompt+mic are visible.
+      if (
+        state.mode === 'concert-speaking' ||
+        state.concertNavLockActive ||
+        state.concertHadQuestion
+      ) {
+        if (!concertCanUnlockForCompletion(done)) {
+          addLog(
+            `Concert ignored generic completion signal while question is active: "${done}"`,
+            'err'
+          );
+
+          state.completionSeen = null;
+        } else {
+          state.completionSeen = done;
+          state.concertCompleted = true;
+          concertReleaseNavigationLock('confirmed Concert completion');
+          concertRestoreForbiddenNavGuards();
+
+          addLog(`✓ Complete: "${done}"`, 'ok');
+          setStatus('Complete');
+          notifyDiscord(
+            'Activity completed',
+            `Answered counter: ${state.answeredCount}`
+          );
+          state.running = false;
+
+          const b = document.getElementById('ln-ac-toggle');
+          if (b) {
+            b.textContent = 'Start';
+            b.classList.remove('active');
+          }
+
+          return;
+        }
+      } else {
+        state.completionSeen = done;
+        addLog(`✓ Complete: "${done}"`, 'ok');
+        setStatus('Complete');
+        notifyDiscord(
+          'Activity completed',
+          `Answered counter: ${state.answeredCount}`
+        );
+        state.running = false;
+
+        const b = document.getElementById('ln-ac-toggle');
+        if (b) {
+          b.textContent = 'Start';
+          b.classList.remove('active');
+        }
+
+        return;
+      }
+    }
+
+    // IMPORTANT: Concert owns the entire tick while its route is active.
+    // No Jumble/MC/WordPod/GapFill/WordPop/Forklift/etc. code is reachable.
+    if (m === 'concert-speaking') {
+      if (state.concertBusy) return;
+
+      state.concertBusy = true;
+      try {
+        await concertSpeakingTick();
+      } catch (e) {
+        const msg = e && e.message ? e.message : String(e);
+        addLog(`Concert Speaking runtime error: ${msg}`, 'err');
+        setStatus('Concert Speaking: runtime error');
+        log('Concert Speaking runtime error', e);
+      } finally {
+        state.concertBusy = false;
       }
       return;
     }
+
+    if (m === 'exam-open-reading') {
+      if (state.examBusy) return;
+      state.examBusy = true;
+      try {
+        await examOpenReadingTick();
+      } catch (e) {
+        addLog(`Exam runtime error: ${e && e.message ? e.message : e}`, 'err');
+        setStatus('Exam: runtime error');
+      } finally {
+        state.examBusy = false;
+      }
+      return;
+    }
+
     if (state.vocab.length === 0 && state.sentences.length === 0 && state.verbs.length === 0) { setStatus(`Waiting for data… (${modeLabel(m)})`); return; }
     if (m === 'jumble') return jumbleTick();
     if (m === 'mc-listening') return mcListeningTick();
@@ -9237,7 +10312,7 @@
     const p = document.createElement('div');
     p.id = 'ln-ac-panel';
     p.innerHTML = `
-      <div id="ln-ac-header"><span>LN Autocompleter v9.5</span><button id="ln-ac-min">–</button></div>
+      <div id="ln-ac-header"><span>LN Autocompleter v10.9</span><button id="ln-ac-min">–</button></div>
       <div id="ln-ac-body">
         <div id="ln-ac-status">Idle</div>
         <div class="ln-ac-stat"><span>Mode</span><span id="ln-ac-mode">—</span></div>
@@ -9336,7 +10411,7 @@
         webhookTest.disabled = true;
         const ok = await sendDiscordWebhook(
           'Webhook test',
-          'Connection from LanguageNut Autocompleter v9.5'
+          'Connection from LanguageNut Autocompleter v10.5'
         );
         webhookTest.disabled = false;
 
@@ -9385,6 +10460,7 @@
       else if (state.mode === 'wordpod-listening' || state.mode === 'wordpod-reading') { resetWordPodState(); addLog('↺'); }
       else if (state.mode === 'skyrise') { resetSkyRiseState(); addLog('↺'); }
       else if (state.mode === 'concert-speaking') { resetConcertState(); addLog('↺'); }
+      else if (state.mode === 'exam-open-reading') { state.examSubmitted = new Set(); addLog('↺'); }
       else if (state.mode === 'mc2-listening' || state.mode === 'mc2-reading') { resetMC2State(); addLog('↺'); }
       else { state.currentAnswer = null; state.currentEntry = null; state.currentPrompt = null; state.lastAudioUrl = null; state.lastAnsweredKey = null; setAudioLabel(''); setPromptLabel(''); addLog('↺'); }
     });
@@ -9447,7 +10523,7 @@
   }
   function updateModeButtons(m) {
     const pl = document.getElementById('ln-ac-play'); if (pl) pl.style.display = (m === 'mc-listening' || m === 'mc2-listening' || m === 'wordpod-listening' || m === 'wordpop-listening') ? '' : 'none';
-    const ps = document.getElementById('ln-ac-prompt'); if (ps) { const r = ps.closest('.ln-ac-stat'); if (r) r.style.display = (m === 'mc-reading' || m === 'mc2-reading' || m === 'wordpod-reading' || m === 'wordpod-listening' || m === 'skyrise' || m === 'concert-speaking' || m === 'fridge' || m === 'verb-matcher' || m === 'jigsaw' || m === 'forklift' || m === 'ocean-cleaner' || m === 'gapfill') ? '' : 'none'; }
+    const ps = document.getElementById('ln-ac-prompt'); if (ps) { const r = ps.closest('.ln-ac-stat'); if (r) r.style.display = (m === 'exam-open-reading' || m === 'mc-reading' || m === 'mc2-reading' || m === 'wordpod-reading' || m === 'wordpod-listening' || m === 'skyrise' || m === 'concert-speaking' || m === 'fridge' || m === 'verb-matcher' || m === 'jigsaw' || m === 'forklift' || m === 'ocean-cleaner' || m === 'gapfill') ? '' : 'none'; }
     const as = document.getElementById('ln-ac-audio'); if (as) { const r = as.closest('.ln-ac-stat'); if (r) r.style.display = (m === 'mc-listening' || m === 'mc2-listening' || m === 'wordpod-listening' || m === 'wordpop-listening') ? '' : 'none'; }
     const ts = document.getElementById('ln-ac-target'); if (ts) { const r = ts.closest('.ln-ac-stat'); if (r) r.style.display = (m === 'jumble') ? '' : 'none'; }
     const ss = document.getElementById('ln-ac-seq'); if (ss) { const r = ss.closest('.ln-ac-stat'); if (r) r.style.display = (m === 'jumble') ? '' : 'none'; }
@@ -9482,6 +10558,9 @@
 
     if (state.running) {
       state.completionSeen = null;
+      state.concertCompleted = false;
+      state.concertHadQuestion = false;
+      concertReleaseNavigationLock();
       b.textContent = 'Stop';
       b.classList.add('active');
 
@@ -9524,8 +10603,17 @@
     } else {
       b.textContent = 'Start';
       b.classList.remove('active');
+
+      const restoredNav = concertRestoreForbiddenNavGuards();
+      state.concertNavGuardLogged = false;
+      concertReleaseNavigationLock('automation stopped');
+
       setStatus('Paused');
-      addLog('■ Paused');
+      addLog(
+        restoredNav > 0
+          ? `■ Paused — restored ${restoredNav} nav control(s)`
+          : '■ Paused'
+      );
     }
   }
 
@@ -9574,7 +10662,7 @@
       addLog(
         `Concert Speaking: prompts=${cp.length}, ` +
         `locked=${state.concertLockedQuestion ? 'yes' : 'no'}, ` +
-        `fails=${state.concertFails}, cycle=${state.concertCycleCount}`
+        `fails=${state.concertFails}`
       );
 
       addLog(
@@ -9611,6 +10699,7 @@
           'Concert exact record: ' +
           (exact
             ? `name=${exact.obj.name || '?'} ` +
+              `target=${exact.target && exact.target.name || '?'} ` +
               `events=${exact.events.join(',') || '(none)'} ` +
               `@ ${Math.round(exact.bounds.x)},${Math.round(exact.bounds.y)} ` +
               `${Math.round(exact.bounds.width)}x${Math.round(exact.bounds.height)}`
@@ -9661,6 +10750,19 @@
             `isCorrect=${String(state.concertEvalResult.isCorrect)}`
           : 'NONE')
       );
+
+      {
+        const exact = concertFindExactRecordButton();
+        if (exact && exact.micCircle) {
+          const ev = concertMakeRecordEvent(exact, 'pointerup');
+          addLog(
+            `Concert synthetic event: target=${ev.target && ev.target.name || '?'} ` +
+            `currentTarget=${ev.currentTarget && ev.currentTarget.name || '?'} ` +
+            `cancelable=${String(ev.cancelable)} composed=${String(ev.composed)} ` +
+            `global=${ev.global.x.toFixed(1)},${ev.global.y.toFixed(1)}`
+          );
+        }
+      }
     }
 
     if (liveMode === 'skyrise') {
@@ -10165,6 +11267,8 @@
     }
     addLog('Completion check: ' + (detectCompletion() || 'no'));
   }
-  function boot() { applyAudioMute(); if (!createPanel()) { const obs = new MutationObserver(() => { if (createPanel()) obs.disconnect(); }); obs.observe(document.documentElement || document, { childList: true, subtree: true }); setTimeout(createPanel, 1000); setTimeout(createPanel, 3000); } tryGrabPixi(); setTimeout(tryGrabPixi, 800); setTimeout(tryGrabPixi, 2500); }
+  function boot() {
+    concertInstallGlobalCanvasBlocker();
+    concertInstallGlobalNavigationLock(); applyAudioMute(); if (!createPanel()) { const obs = new MutationObserver(() => { if (createPanel()) obs.disconnect(); }); obs.observe(document.documentElement || document, { childList: true, subtree: true }); setTimeout(createPanel, 1000); setTimeout(createPanel, 3000); } tryGrabPixi(); setTimeout(tryGrabPixi, 800); setTimeout(tryGrabPixi, 2500); }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot); else boot();
 })();
