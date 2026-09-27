@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LanguageNut Autocompleter (Jumble + MC + Fridge)
 // @namespace    languagenut-autocompleter
-// @version      11.6
+// @version      12.13
 // @description  Autocompletes LanguageNut vocab/sentence activities including WordPod, Skyrise and Concert Speaking
 // @author       You
 // @match        *://*.languagenut.com/*
@@ -16,6 +16,8 @@
 
   const CONFIG = {
     loopPauseMs: 30, debug: true, logAllFetches: true, showClickMarker: true,
+    libreTranslateUrl: 'https://libretranslate.com/translate',
+    libreTranslateApiKey: '',
     jumbleClickMs: 0,
     afterLaunchMs: 900,
     afterSolveMs: 800,
@@ -29,8 +31,8 @@
     // Independent delays for the two newer modes:
     verbMatcherBetweenClicksMs: 180,
     verbMatcherAfterPairMs: 450,
-    jigsawBetweenClicksMs: 40,
-    jigsawAfterPairMs: 90,
+    jigsawBetweenClicksMs: 120,
+    jigsawAfterPairMs: 200,
 
     forkliftPickDelayMs: 80,
     forkliftMoveSettleMs: 420,
@@ -46,10 +48,9 @@
     gapAfterSubmitMs: 700,
     gapMaxFails: 8,
 
-    // Fast mode is intentionally close to instant.  The old 4× ticker speed
-    // still left CSS tweens and solver settle delays visible, so the toggle
-    // now uses a high time scale and collapses our own waits as well.
-    fastAnimationSpeed: 100,
+    // Bound tween speed so fast mode cannot starve the input/game loop.
+    // Pixi's simulation ticker stays at 1×; CSS and solver waits are short.
+    fastAnimationSpeed: 4,
 
     mc2AfterPlayMs: 350,
     mc2AfterClickMs: 180,
@@ -90,7 +91,7 @@
   const log = (...a) => CONFIG.debug && console.log('%c[LN-AC]', 'color:#4ade80;font-weight:bold', ...a);
 
   const state = {
-    pixiApp: null, vocab: [], sentences: [], verbs: [], running: false, mode: null,
+    pixiApp: null, vocab: [], vocabRoute: '', sentences: [], verbs: [], running: false, mode: null,
     targetWord: '', targetLetters: '',
     jumbleOrderedChunks: [], jumblePlacedCount: 0,
     placedTiles: new Set(),
@@ -135,9 +136,26 @@
     concertCompleted: false,
     concertHadQuestion: false,
     examTranslations: [], examOriginalText: '', examBusy: false, examSubmitted: new Set(),
+    examPhotoQuestion: null, examPhotoSubmittedKey: '',
     examGapOrder: [], examGapIndex: 0, examGapBusy: false, examGapSubmitted: false,
     examContinueBusy: false, examContinueAt: 0,
-    fakeTimeSeconds: 30, fakeTimeAnswerBase: 0, fakeTimeServicesHooked: false,
+    continueLastControl: null, continueLastAt: 0,
+    examDictationData: null, examDictationEntries: [], examDictationBusy: false, examDictationSubmitted: false,
+    examInterpretSubmitted: false, lastInterpretPrompt: null,
+    interpretCache: new Map(), interpretTranslating: false, interpretLogged: new Set(),
+    whoSaidWhatStatements: [], whoSaidWhatSubmitted: false,
+    lastStartDismissAt: 0,
+    lastMCOptionsKey: null, lastMCPlayAttemptAt: 0,
+    lastMC2Sig: null, lastMC2PlayAttemptAt: 0,
+    fakeTimeMin: 20, fakeTimeMax: 30, fakeTimeSamples: [],
+    fakeTimeLoggedCount: 0, fakeTimeCompletionLogged: false,
+    fakeTimeAnswerBase: 0, fakeTimeServicesHooked: false,
+    zenMemoryBusy: false, zenMemoryLastCount: 0,
+    zenNoughtsBusy: false, zenNoughtsLastCount: 0, zenNoughtsNextMoveAt: 0,
+    raceBusy: false, raceLastQuestion: '', raceLastChunks: 0,
+    raceRightHeld: false, raceBoostTarget: null, raceBoostAssertAt: 0,
+    dictationBusy: false, dictationSubmitted: false,
+    dictationSawHidden: false, dictationLastAudio: '', dictationPlayAt: 0,
     discordWebhook: '', webhookLastAnswered: 0, webhookSending: false,
     wordPopFails: 0, wordPopLastKey: null, wordPopBusy: false,
     wordPopAudioBusy: false, wordPopLastSignature: null,
@@ -178,14 +196,45 @@
   state.muteAudio = loadBoolSetting('muteAudio', false);
   state.fastAnimations = loadBoolSetting('fastAnimations', false);
   state.discordWebhook = loadStringSetting('discordWebhook', '');
-  state.fakeTimeSeconds = Math.max(1, Math.min(3600,
-    Number(loadStringSetting('fakeTimeSeconds', '30')) || 30
-  ));
+  state.fakeTimeMin = Math.max(1, Math.min(3600,
+    Number(loadStringSetting('fakeTimeMin', '20')) || 20));
+  state.fakeTimeMax = Math.max(state.fakeTimeMin, Math.min(3600,
+    Number(loadStringSetting('fakeTimeMax', '30')) || 30));
+
+  function fakeTimeSample(index) {
+    const i = Math.max(0, Math.floor(index));
+    while (state.fakeTimeSamples.length <= i) {
+      const spread = state.fakeTimeMax - state.fakeTimeMin + 1;
+      state.fakeTimeSamples.push(state.fakeTimeMin + Math.floor(Math.random() * spread));
+    }
+    return state.fakeTimeSamples[i];
+  }
+
+  function fakeTimeNextMilliseconds() {
+    return fakeTimeSample(state.answeredCount - state.fakeTimeAnswerBase) * 1000;
+  }
 
   function fakeTimeMilliseconds(questionCount) {
     const count = Math.max(1, Number(questionCount) ||
       state.answeredCount - state.fakeTimeAnswerBase || 1);
-    return Math.round(count * state.fakeTimeSeconds * 1000);
+    let total = 0;
+    for (let i = 0; i < count; i++) total += fakeTimeSample(i);
+    return total * 1000;
+  }
+
+  function resetFakeTimeActivity() {
+    state.fakeTimeAnswerBase = state.answeredCount;
+    state.fakeTimeSamples = [];
+    state.fakeTimeLoggedCount = 0;
+    state.fakeTimeCompletionLogged = false;
+  }
+
+  function logFakeTimeCompletion() {
+    if (state.fakeTimeCompletionLogged) return;
+    const count = Math.max(0, state.answeredCount - state.fakeTimeAnswerBase);
+    if (!count) return;
+    state.fakeTimeCompletionLogged = true;
+    addLog(`Simulated ${fakeTimeMilliseconds(count) / 1000}s across ${count} answered question${count === 1 ? '' : 's'}`, 'ok');
   }
 
   function hookServicesFakeTime() {
@@ -204,14 +253,15 @@
             const now = Date.now();
             for (let i = 0; i < stamps.length; i++) {
               if (Array.isArray(stamps[i]) && stamps[i].length > 1) {
-                stamps[i][1] = now - (stamps.length - 1 - i) * state.fakeTimeSeconds * 1000;
+                let trailing = 0;
+                for (let j = i + 1; j < stamps.length; j++) trailing += fakeTimeSample(j);
+                stamps[i][1] = now - trailing * 1000;
               }
             }
           }
           addLog(`Reported game time: ${Math.round(data.awrtfuoivg / 1000)}s`, 'ok');
         } else if (/examTranslationController\/addExamDataAnswer(?:Text|Audio)/i.test(String(endpoint))) {
-          data.timeTaken = fakeTimeMilliseconds(1);
-          addLog(`Reported exam time: ${state.fakeTimeSeconds}s`, 'ok');
+          data.timeTaken = fakeTimeNextMilliseconds();
         }
       }
       return original.apply(this, arguments);
@@ -227,10 +277,23 @@
     const isScore = /gameDataController\/addGameScore/i.test(endpoint);
     const isExamText = /examTranslationController\/addExamDataAnswerText/i.test(endpoint);
     if (!isScore && !isExamText) return body;
-    const params = new URLSearchParams(body);
-    if (isScore) params.set('awrtfuoivg', String(fakeTimeMilliseconds(params.get('vocabNumber'))));
-    else params.set('timeTaken', String(fakeTimeMilliseconds(1)));
-    return params.toString();
+    const trimmed = body.trim();
+    if (trimmed.startsWith('{')) {
+      try {
+        const json = JSON.parse(trimmed);
+        if (isScore) json.awrtfuoivg = fakeTimeMilliseconds(json.vocabNumber);
+        else json.timeTaken = fakeTimeNextMilliseconds();
+        return JSON.stringify(json);
+      } catch (_) {}
+    }
+    try {
+      const params = new URLSearchParams(body);
+      if (isScore) params.set('awrtfuoivg', String(fakeTimeMilliseconds(params.get('vocabNumber'))));
+      else params.set('timeTaken', String(fakeTimeNextMilliseconds()));
+      return params.toString();
+    } catch (_) {
+      return body;
+    }
   }
 
   function validDiscordWebhook(url) {
@@ -295,9 +358,7 @@
   }
 
   function applyAnimationSpeed() {
-    // Apply the same speed to every activity, including Jigsaw.  Fast mode
-    // also collapses the solver waits below, so there is no leftover visual
-    // animation in one mode while the others run instantly.
+    // Keep game simulation responsive while shortening tweens and waits.
     const speed = state.fastAnimations ? CONFIG.fastAnimationSpeed : 1;
 
     try {
@@ -306,7 +367,9 @@
         state.pixiApp.ticker &&
         typeof state.pixiApp.ticker.speed === 'number'
       ) {
-        state.pixiApp.ticker.speed = speed;
+        // A 100× Pixi ticker can make game loops run thousands of updates per
+        // frame and starve input. Keep simulation time real; speed up tweens.
+        state.pixiApp.ticker.speed = 1;
       }
     } catch (_) {}
 
@@ -318,7 +381,8 @@
         window.gsap.globalTimeline &&
         typeof window.gsap.globalTimeline.timeScale === 'function'
       ) {
-        window.gsap.globalTimeline.timeScale(speed);
+        if (window.gsap.globalTimeline.timeScale() !== speed)
+          window.gsap.globalTimeline.timeScale(speed);
       }
     } catch (_) {}
 
@@ -327,7 +391,8 @@
         window.TweenMax &&
         typeof window.TweenMax.globalTimeScale === 'function'
       ) {
-        window.TweenMax.globalTimeScale(speed);
+        if (window.TweenMax.globalTimeScale() !== speed)
+          window.TweenMax.globalTimeScale(speed);
       }
     } catch (_) {}
 
@@ -336,7 +401,8 @@
         window.TweenLite &&
         typeof window.TweenLite.globalTimeScale === 'function'
       ) {
-        window.TweenLite.globalTimeScale(speed);
+        if (window.TweenLite.globalTimeScale() !== speed)
+          window.TweenLite.globalTimeScale(speed);
       }
     } catch (_) {}
 
@@ -351,14 +417,15 @@
           style.id = 'ln-ac-instant-animations';
           (document.head || document.documentElement).appendChild(style);
         }
-        style.textContent =
+        const css =
           '*,*::before,*::after{' +
-          'animation-duration:0s!important;' +
+          'animation-duration:0.01s!important;' +
           'animation-delay:0s!important;' +
-          'transition-duration:0s!important;' +
+          'transition-duration:0.01s!important;' +
           'transition-delay:0s!important;' +
           'scroll-behavior:auto!important;' +
           '}';
+        if (style.textContent !== css) style.textContent = css;
       } else if (style) {
         style.remove();
       }
@@ -373,8 +440,17 @@
   // ============ DATA HOOKS ============
   function isVocabUrl(u) { return typeof u === 'string' && u.indexOf('getVocabTranslations') !== -1; }
   function isSentenceUrl(u) { return typeof u === 'string' && u.indexOf('getSentenceTranslations') !== -1; }
-  function isVerbUrl(u) { return typeof u === 'string' && u.indexOf('getVerbTranslations') !== -1; }
+  function isVerbUrl(u) {
+    return typeof u === 'string' && (
+      u.indexOf('getVerbTranslations') !== -1 ||
+      /verbTranslationController/i.test(u) ||
+      /verbController/i.test(u) ||
+      /getTranslations/i.test(u) ||
+      /getUserModuleTranslations/i.test(u)
+    );
+  }
   function isExamTranslationsUrl(u) { return typeof u === 'string' && /examTranslationController\/getExamTranslationsCorrect/i.test(u); }
+  function isExamDataTranslationsUrl(u) { return typeof u === 'string' && /examTranslationController\/getExamData/i.test(u); }
   function isInterestingUrl(u) { return typeof u === 'string' && /vocab|verb|translation|homework|assignment|question|content|sentence/i.test(u); }
 
   function isConcertEvalUrl(u) {
@@ -432,9 +508,11 @@
     }
   }
 
-  function ingestVocab(b) {
+  function ingestVocab(b, route) {
     try { const d = typeof b === 'string' ? JSON.parse(b) : b; if (!d || !Array.isArray(d.vocabTranslations)) return;
-      state.vocab = d.vocabTranslations; addLog(`Vocab loaded: ${state.vocab.length}`, 'ok'); setVocabCount(state.vocab.length + state.sentences.length + state.verbs.length);
+      if (route && route !== location.hash) return;
+      state.vocab = d.vocabTranslations; state.vocabRoute = route || location.hash;
+      addLog(`Vocab loaded: ${state.vocab.length}`, 'ok'); setVocabCount(state.vocab.length + state.sentences.length + state.verbs.length);
     } catch (e) { log('vocab parse failed', e); }
   }
   function ingestSentences(b) {
@@ -511,28 +589,98 @@
           kind: xml.querySelector('removed') ? 'gapfill' : 'exam'
         };
       }).filter(entry => entry.answer && (entry.question || entry.kind === 'gapfill'));
-      state.examTranslations = parsed;
-      state.examSubmitted = new Set();
-      state.examGapOrder = [];
-      state.examGapIndex = 0;
-      state.examGapSubmitted = false;
-      addLog(`Exam answers loaded: ${parsed.length}`, 'ok');
-      setVocabCount(state.vocab.length + state.sentences.length + state.verbs.length + parsed.length);
+      if (parsed.length) {
+        state.examTranslations = parsed;
+        state.examSubmitted = new Set();
+        state.examGapOrder = [];
+        state.examGapIndex = 0;
+        state.examGapSubmitted = false;
+        addLog(`Exam answers loaded: ${parsed.length}`, 'ok');
+        setVocabCount(state.vocab.length + state.sentences.length + state.verbs.length + parsed.length);
+      }
+
+      const whoSaidWhat = [];
+      data.examTranslations.forEach(entry => {
+        const rawOther = String(entry.other || '');
+        const tagRegex = /<person([A-Za-z])>([\s\S]*?)<\/person\1>/gi;
+        let match;
+        while ((match = tagRegex.exec(rawOther)) !== null) {
+          const statement = match[2].trim();
+          if (statement) {
+            whoSaidWhat.push({
+              person: match[1].toUpperCase(),
+              statement,
+              normalisedStatement: normaliseText(statement)
+            });
+          }
+        }
+      });
+      if (whoSaidWhat.length) {
+        state.whoSaidWhatStatements = whoSaidWhat;
+        state.whoSaidWhatSubmitted = false;
+        addLog(`Who Said What loaded: ${whoSaidWhat.length} statements`, 'ok');
+        setVocabCount(state.vocab.length + state.sentences.length + state.verbs.length + whoSaidWhat.length);
+      }
     } catch (e) { log('exam translation parse failed', e); }
+  }
+  function ingestExamDataTranslations(body) {
+    try {
+      const data = typeof body === 'string' ? JSON.parse(body) : body;
+      if (!data) return;
+      if (/#\/alevelPhoto(?:[/?]|$)/i.test(location.href) && data.examQuestion?.image) {
+        const next = data.examQuestion;
+        const key = `${next.uid || ''}|${next.image || ''}`;
+        const previous = state.examPhotoQuestion;
+        if (!previous || `${previous.uid || ''}|${previous.image || ''}` !== key) {
+          state.examPhotoSubmittedKey = '';
+        }
+        state.examPhotoQuestion = next;
+        addLog(`Photo exam loaded: ${next.image}`, 'ok');
+        setVocabCount(1);
+        return;
+      }
+      const raw = data.examData || data.examDataLarge || data.examDataOriginal || data.data;
+      if (!raw) return;
+      const items = Array.isArray(raw) ? raw : [raw];
+      const parsed = items.map(ed => {
+        const text = String(
+          ed.mainText ||
+          ed.text ||
+          ed.answer ||
+          (ed.examTranslationData && ed.examTranslationData[0] && ed.examTranslationData[0].text) ||
+          ''
+        ).trim();
+        return {
+          uid: String(ed.uid || ''),
+          text: text.replace(/\r\n/g, '\n'),
+          rawText: text,
+          ietf: String(ed.ietf || ed.toIetf || ''),
+          audio: String(ed.audio || '')
+        };
+      }).filter(entry => entry.text);
+      if (!parsed.length) return;
+      state.examDictationEntries = parsed;
+      state.examDictationData = parsed[0];
+      state.examDictationSubmitted = false;
+      addLog(`Exam text/dictation loaded (${parsed[0].text.length} chars, uid ${parsed[0].uid})`, 'ok');
+      setVocabCount(state.vocab.length + state.sentences.length + state.verbs.length + parsed.length);
+    } catch (e) { log('exam data translation parse failed', e); }
   }
   (function () { const orig = window.fetch; if (!orig) return;
     window.fetch = function (input) {
       const url = typeof input === 'string' ? input : (input && input.url);
+      const requestRoute = location.hash;
       if (CONFIG.logAllFetches && isInterestingUrl(url)) log('fetch →', String(url).slice(0, 120));
       if (arguments[1] && typeof arguments[1].body === 'string') {
         const body = rewriteFakeTimeBody(url, arguments[1].body);
         if (body !== arguments[1].body) arguments[1] = {...arguments[1], body};
       }
       const p = orig.apply(this, arguments);
-      if (isVocabUrl(url)) p.then(r => r.clone().text().then(ingestVocab).catch(()=>{}));
+      if (isVocabUrl(url)) p.then(r => r.clone().text().then(body => ingestVocab(body, requestRoute)).catch(()=>{}));
       if (isSentenceUrl(url)) p.then(r => r.clone().text().then(ingestSentences).catch(()=>{}));
       if (isVerbUrl(url)) p.then(r => r.clone().text().then(ingestVerbs).catch(()=>{}));
       if (isExamTranslationsUrl(url)) p.then(r => r.clone().text().then(ingestExamTranslations).catch(()=>{}));
+      if (isExamDataTranslationsUrl(url)) p.then(r => r.clone().text().then(ingestExamDataTranslations).catch(()=>{}));
       if (isConcertEvalUrl(url)) {
         p.then(r =>
           r.clone().text()
@@ -546,12 +694,13 @@
   (function () { const open = XMLHttpRequest.prototype.open, send = XMLHttpRequest.prototype.send;
     XMLHttpRequest.prototype.open = function (m, url) {
       if (state.running && /examTranslationController\/addExamDataAnswerAudio/i.test(String(url))) {
-        const reported = fakeTimeMilliseconds(1);
+        const reported = fakeTimeNextMilliseconds();
         url = String(url).replace(/([?&]timeTaken=)\d+/i, `$1${reported}`);
         arguments[1] = url;
-        addLog(`Reported exam audio time: ${state.fakeTimeSeconds}s`, 'ok');
+        addLog(`Exam audio simulated ${reported / 1000}s`, 'ok');
       }
       this.__ln_url = url;
+      this.__ln_route = location.hash;
       if (CONFIG.logAllFetches && isInterestingUrl(url)) log('xhr →', String(url).slice(0, 120));
       return open.apply(this, arguments);
     };
@@ -560,10 +709,11 @@
         arguments[0] = rewriteFakeTimeBody(this.__ln_url, arguments[0]);
       }
       this.addEventListener('load', function () {
-        if (isVocabUrl(this.__ln_url)) ingestVocab(this.responseText);
+        if (isVocabUrl(this.__ln_url)) ingestVocab(this.responseText, this.__ln_route);
         if (isSentenceUrl(this.__ln_url)) ingestSentences(this.responseText);
         if (isVerbUrl(this.__ln_url)) ingestVerbs(this.responseText);
         if (isExamTranslationsUrl(this.__ln_url)) ingestExamTranslations(this.responseText);
+        if (isExamDataTranslationsUrl(this.__ln_url)) ingestExamDataTranslations(this.responseText);
         if (isConcertEvalUrl(this.__ln_url)) {
           let raw = '';
           try {
@@ -627,14 +777,15 @@
   }
 
   function matchAudioToEntry(url) {
-    if (!state.vocab.length) return null;
+    const pool = (state.vocab.length ? state.vocab : []).concat(state.sentences.length ? state.sentences : []);
+    if (!pool.length) return null;
 
     const playedBase = baseName(url).toLowerCase();
     const playedStem = audioStem(url);
     if (!playedStem) return null;
 
-    // 1) Exact basename/stem against ANY string field in the vocab entry.
-    for (const e of state.vocab) {
+    // 1) Exact basename/stem against ANY string field in the vocab/sentence entry.
+    for (const e of pool) {
       const values = collectEntryStringValues(e);
 
       for (const v of values) {
@@ -652,13 +803,14 @@
     if (numeric) {
       const id = numeric[1];
 
-      for (const e of state.vocab) {
+      for (const e of pool) {
         const ids = [
           e.uid,
           e.id,
           e.vocabUid,
           e.translationUid,
-          e.wordUid
+          e.wordUid,
+          e.sentenceUid
         ].filter(v => v != null).map(String);
 
         if (ids.includes(id)) return e;
@@ -666,7 +818,7 @@
     }
 
     // 3) Last-resort stem containment for audio-looking entry strings only.
-    for (const e of state.vocab) {
+    for (const e of pool) {
       const values = collectEntryStringValues(e)
         .filter(v => /\.(mp3|wav|ogg|m4a|aac)(?:[?#].*)?$/i.test(v));
 
@@ -682,9 +834,11 @@
 
     return null;
   }
-  function recordAudio(url) { if (!url) return; state.lastAudioUrl = String(url); if ((state.mode !== 'mc-listening' && state.mode !== 'mc2-listening' && state.mode !== 'wordpod-listening' && state.mode !== 'wordpop-listening') || state.vocab.length === 0) return;
+  function recordAudio(url) { if (!url) return; state.lastAudioUrl = String(url); if ((state.mode !== 'mc-listening' && state.mode !== 'mc2-listening' && state.mode !== 'wordpod-listening' && state.mode !== 'wordpop-listening') || (state.vocab.length === 0 && state.sentences.length === 0)) return;
     const e = matchAudioToEntry(url); if (!e) return; state.currentEntry = e;
-    state.currentAnswer = { word: (e.word || '').trim(), originalWord: (e.originalWord || '').trim() };
+    const word = String(e.word || e.sentence || e.originalSentence || '').trim();
+    const orig = String(e.originalWord || e.translation || e.translatedSentence || '').trim();
+    state.currentAnswer = { word, originalWord: orig };
     addLog(`Audio → "${state.currentAnswer.word}" / "${state.currentAnswer.originalWord}"`, 'ok');
     setAudioLabel(`${state.currentAnswer.word} ⟷ ${state.currentAnswer.originalWord}`); }
   (function () {
@@ -838,11 +992,106 @@
     return true;
   }
 
+  async function dragTileTo(tileObj, targetBoundsOrObj) {
+    const realTileObj = (tileObj && tileObj.obj) ? tileObj.obj : tileObj;
+    let startBounds = (tileObj && tileObj.bounds) || boundsOf(realTileObj);
+    if (!startBounds && realTileObj && typeof realTileObj.toGlobal === 'function') {
+      try {
+        const gp = realTileObj.toGlobal({ x: 0, y: 0 });
+        startBounds = { x: gp.x, y: gp.y, width: realTileObj.width || 80, height: realTileObj.height || 40 };
+      } catch (_) {}
+    }
+    if (!startBounds) return false;
+    const start = worldToClient(startBounds);
+    if (!start) return false;
+
+    const realTargetObj = (targetBoundsOrObj && targetBoundsOrObj.obj) ? targetBoundsOrObj.obj : targetBoundsOrObj;
+    let targetBounds = realTargetObj && typeof realTargetObj.getBounds === 'function'
+      ? boundsOf(realTargetObj)
+      : (targetBoundsOrObj && targetBoundsOrObj.bounds) ? targetBoundsOrObj.bounds : targetBoundsOrObj;
+    if (targetBounds && typeof targetBounds === 'object' && !('x' in targetBounds)) {
+      targetBounds = boundsOf(realTargetObj);
+    }
+    if (!targetBounds && realTargetObj && typeof realTargetObj.toGlobal === 'function') {
+      try {
+        const gp = realTargetObj.toGlobal({ x: 0, y: 0 });
+        targetBounds = { x: gp.x, y: gp.y, width: realTargetObj.width || 80, height: realTargetObj.height || 40 };
+      } catch (_) {}
+    }
+    if (!targetBounds) return false;
+
+    const targetPoint = {
+      x: targetBounds.x,
+      y: targetBounds.y,
+      width: targetBounds.width || 0,
+      height: targetBounds.height || 0
+    };
+    const end = worldToClient(targetPoint);
+    if (!end) return false;
+
+    const startWorld = {
+      x: startBounds.x + (startBounds.width || 0) / 2,
+      y: startBounds.y + (startBounds.height || 0) / 2
+    };
+    const endWorld = {
+      x: targetBounds.x + (targetBounds.width || 0) / 2,
+      y: targetBounds.y + (targetBounds.height || 0) / 2
+    };
+
+    const canvas = state.pixiApp && state.pixiApp.view;
+    if (!canvas) return false;
+
+    showClickMarker(start.x, start.y, '#4ade80');
+    firePointerEvent(canvas, 'pointerover', start.x, start.y, 0);
+    firePointerEvent(canvas, 'pointermove', start.x, start.y, 0);
+    canvas.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, cancelable: true, view: window, clientX: start.x, clientY: start.y }));
+    await sleep(20);
+
+    firePointerEvent(canvas, 'pointerdown', start.x, start.y, 1);
+    canvas.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window, clientX: start.x, clientY: start.y, button: 0, buttons: 1 }));
+    emitOnObject(realTileObj, 'pointerdown', startWorld);
+    emitOnObject(realTileObj, 'mousedown', startWorld);
+    await sleep(35);
+
+    const steps = 8;
+    for (let i = 1; i <= steps; i++) {
+      const cx = start.x + (end.x - start.x) * (i / steps);
+      const cy = start.y + (end.y - start.y) * (i / steps);
+      const curWorld = {
+        x: startWorld.x + (endWorld.x - startWorld.x) * (i / steps),
+        y: startWorld.y + (endWorld.y - startWorld.y) * (i / steps)
+      };
+      firePointerEvent(canvas, 'pointermove', cx, cy, 1);
+      canvas.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy, button: 0, buttons: 1 }));
+      emitOnObject(realTileObj, 'pointermove', curWorld);
+      emitOnObject(realTileObj, 'mousemove', curWorld);
+      if (state.pixiApp && state.pixiApp.stage) {
+        emitOnObject(state.pixiApp.stage, 'pointermove', curWorld);
+      }
+      await new Promise(r => setTimeout(r, state.fastAnimations ? 4 : 15));
+    }
+    await sleep(35);
+
+    showClickMarker(end.x, end.y, '#ffb45c');
+    firePointerEvent(canvas, 'pointerup', end.x, end.y, 0);
+    canvas.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window, clientX: end.x, clientY: end.y }));
+    canvas.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window, clientX: end.x, clientY: end.y }));
+    emitOnObject(realTileObj, 'pointerup', endWorld);
+    emitOnObject(realTileObj, 'mouseup', endWorld);
+    if (state.pixiApp && state.pixiApp.stage) {
+      emitOnObject(state.pixiApp.stage, 'pointerup', endWorld);
+    }
+    if (realTargetObj && typeof realTargetObj === 'object' && realTargetObj.emit) {
+      emitOnObject(realTargetObj, 'pointerup', endWorld);
+      emitOnObject(realTargetObj, 'mouseup', endWorld);
+    }
+    await sleep(40);
+    return true;
+  }
+
   const sleep = ms => {
-    // Fast mode is also used by the activity solvers.  Collapsing these waits
-    // is what makes clicks and answer submission happen immediately instead
-    // of only accelerating Pixi's visual ticker.
-    const delay = state.fastAnimations ? 0 : Number(ms) || 0;
+    // Always leave a small event-loop gap so input handlers can finish.
+    const delay = state.fastAnimations ? Math.min(30, Math.max(8, (Number(ms) || 0) / 10)) : Number(ms) || 0;
     return delay > 0 ? new Promise(r => setTimeout(r, delay)) : Promise.resolve();
   };
 
@@ -922,6 +1171,7 @@
           ? Math.max(
             examGapfillEntries().length,
             state.examTranslations.length,
+            state.examDictationEntries.length || (state.examDictationData ? 1 : 0),
             Number(m[2])
           )
           : Number(m[2]);
@@ -946,19 +1196,32 @@
       /[?&](?:game|activity)=concert(?:[&#]|$)/i.test(u);
   }
 
+  function isInterpretRoute() {
+    const u = String(location.href || '');
+    return /#\/(?:Interpret|interpret|translation|alevelTranslation)(?:[/?]|$)/i.test(u) ||
+      /[?&](?:game|activity)=(?:Interpret|interpret|translation|alevelTranslation)\b/i.test(u);
+  }
+
   // ============ MODE ============
-  function modeLabel(m) { if (m === 'exam-interpret') return 'Exam Interpret'; if (m === 'exam-gapfill') return 'Exam GapFill'; if (m === 'exam-synonym') return 'Exam Synonym'; if (m === 'exam-open-listening') return 'Exam Open Listening'; if (m === 'exam-true-false') return 'Exam True / False'; if (m === 'exam-multiple-choice') return 'Exam Multiple Choice'; if (m === 'exam-open-reading') return 'Exam Open Reading'; if (m === 'jumble') return 'Jumble'; if (m === 'mc-listening') return 'MC Listening'; if (m === 'mc-reading') return 'MC Reading'; if (m === 'mc2-listening') return 'Multiple Choice 2 Listening'; if (m === 'mc2-reading') return 'Multiple Choice 2 Reading'; if (m === 'wordpod-reading') return 'WordPod Reading'; if (m === 'wordpod-listening') return 'WordPod Listening'; if (m === 'skyrise') return 'Skyrise'; if (m === 'concert-speaking') return 'Concert Speaking'; if (m === 'wordpop-listening') return 'WordPop Listening'; if (m === 'ocean-cleaner') return 'Ocean Cleaner'; if (m === 'gapfill') return 'GapFill'; if (m === 'fridge') return 'Fridge / Sentence'; if (m === 'verb-matcher') return 'Verb Matcher'; if (m === 'jigsaw') return 'Jigsaw'; if (m === 'forklift') return 'Forklift'; return '—'; }
+  function modeLabel(m) { if (m === 'dictation') return 'Dictation'; if (m === 'zen-noughts') return 'Noughts & Crosses'; if (m === 'zen-memory') return 'Matching Pairs'; if (m === 'race-driver') return 'Race Driver'; if (m === 'exam-photo') return 'A-Level Photo'; if (m === 'exam-who-said-what') return 'Who Said What'; if (m === 'exam-dictation') return 'Exam Dictation / Text'; if (m === 'exam-interpret') return 'Exam Interpret / Translation'; if (m === 'exam-gapfill') return 'Exam GapFill'; if (m === 'exam-synonym') return 'Exam Synonym'; if (m === 'exam-open-listening') return 'Exam Open Listening'; if (m === 'exam-true-false') return 'Exam True / False'; if (m === 'exam-multiple-choice') return 'Exam Multiple Choice'; if (m === 'exam-open-reading') return 'Exam Open Reading'; if (m === 'jumble') return 'Jumble'; if (m === 'mc-listening') return 'MC Listening'; if (m === 'mc-reading') return 'MC Reading'; if (m === 'mc2-listening') return 'Multiple Choice 2 Listening'; if (m === 'mc2-reading') return 'Multiple Choice 2 Reading'; if (m === 'wordpod-reading') return 'WordPod Reading'; if (m === 'wordpod-listening') return 'WordPod Listening'; if (m === 'skyrise') return 'Skyrise'; if (m === 'concert-speaking') return 'Concert Speaking'; if (m === 'wordpop-listening') return 'WordPop Listening'; if (m === 'ocean-cleaner') return 'Ocean Cleaner'; if (m === 'gapfill') return 'GapFill'; if (m === 'fridge') return 'Fridge / Sentence'; if (m === 'verb-matcher') return 'Verb Matcher'; if (m === 'jigsaw') return 'Jigsaw'; if (m === 'forklift') return 'Forklift'; return '—'; }
   function detectMode() {
     const u = location.href;
 
     // Strong URL identifiers first.
+    if (/#\/(?:ExamDataDictation|ExamDataText|ExamDataTextLarge)(?:[/?]|$)/i.test(u) || /[?&]game=(?:ExamDataDictation|ExamDataText|ExamDataTextLarge)\b/i.test(u)) return 'exam-dictation';
+    if (/#\/Dictation(?:[/?]|$)/i.test(u)) return 'dictation';
+    if (/#\/WhoSaidWhat(?:[/?]|$)/i.test(u) || /[?&]game=WhoSaidWhat\b/i.test(u)) return 'exam-who-said-what';
+    if (/#\/alevelPhoto(?:[/?]|$)/i.test(u)) return 'exam-photo';
     if (/#\/alevelOpenReading(?:[/?]|$)/i.test(u)) return 'exam-open-reading';
     if (/#\/alevelOpenListening(?:[/?]|$)/i.test(u)) return 'exam-open-listening';
     if (/#\/alevelSynonym(?:[/?]|$)/i.test(u)) return 'exam-synonym';
-    if (/#\/(?:Interpret|interpret)(?:[/?]|$)/i.test(u)) return 'exam-interpret';
+    if (isInterpretRoute()) return 'exam-interpret';
     if (/#\/GapfillExam(?:Alt)?(?:[/?]|$)/i.test(u)) return 'exam-gapfill';
     if (/#\/(?:MultiChoiceExam|MultiChoiceListeningExam)(?:Alt)?(?:[/?]|$)/i.test(u)) return 'exam-multiple-choice';
     if (/#\/(?:TrueFalseExam|TrueFalseListeningExam)(?:Alt)?(?:[/?]|$)/i.test(u)) return 'exam-true-false';
+    if (/#\/ZenNoughtsAndCrosses(?:[/?]|$)/i.test(u)) return 'zen-noughts';
+    if (/#\/ZenMemoryGame(?:[/?]|$)/i.test(u)) return 'zen-memory';
+    if (/#\/RaceDriverGame(?:[/?]|$)/i.test(u)) return 'race-driver';
     if (/\/ZenJumble\b/i.test(u)) return 'jumble';
     if (/\/ZenListening\b/i.test(u)) return 'mc-listening';
     if (/\/ZenReading\b/i.test(u)) return 'mc-reading';
@@ -981,7 +1244,11 @@
 
     if (/WordPop/i.test(u) || /wordpop/i.test(u)) return 'wordpop-listening';
     if (/GapFill/i.test(u) || /Gapfill/i.test(u) || /gapfill/i.test(u)) return 'gapfill';
-    if (/FishingGame/i.test(u) || /OceanCleaner/i.test(u) || /Ocean Cleaner/i.test(u)) return 'ocean-cleaner';
+    if (
+      /(?:FishingGame|OceanCleaner|Ocean_Cleaner|Fishing|Ocean)\b/i.test(u) ||
+      /[?&#/](?:fishing|oceancleaner|ocean)[/?&#_=-]/i.test(u) ||
+      /games\/(?:fishing|ocean)/i.test(u)
+    ) return 'ocean-cleaner';
     if (/ForkliftGame/i.test(u) || /\/Forklift\b/i.test(u)) return 'forklift';
     if (/Jigsaw/i.test(u) || /jigsaw/i.test(u)) return 'jigsaw';
     if (/VerbMatcher/i.test(u) || /verbMatcher/i.test(u)) return 'verb-matcher';
@@ -1080,9 +1347,24 @@
       let oc = false;
       walk(a.stage, (o) => {
         if (oc) return;
-        if (/games\/fishing\//i.test(fullTextureName(o))) oc = true;
+        const f = fullTextureName(o);
+        const n = textureName(o);
+        if (
+          /games\/(?:fishing|ocean)\//i.test(f) ||
+          /(?:fishing|oceancleaner)/i.test(f) ||
+          /container_\d+/i.test(f) ||
+          /container_\d+/i.test(n)
+        ) oc = true;
       });
       if (oc) return 'ocean-cleaner';
+
+      let who = false;
+      walk(a.stage, (o) => {
+        if (who) return;
+        const tex = `${fullTextureName(o)} ${textureName(o)}`;
+        if (/who\/(?:a|b|c|ans)\.png/i.test(tex) || (typeof o.text === 'string' && /who said what/i.test(o.text))) who = true;
+      });
+      if (who) return 'exam-who-said-what';
 
       let fk = false;
       walk(a.stage, (o) => {
@@ -1424,7 +1706,25 @@
   // ============ MC ============
   function isSoundTexture(n) { return /SoundButton|SoundIcon|AudioButton|audioWordPod/i.test(n); }
   function isResultTexture(n) { return /correctResult|incorrectResult|correct\.png|incorrect\.png|Tick|BigTick|BigCross|Cross|correctAnswer/i.test(n); }
-  function findSoundButton() { const a = state.pixiApp; if (!a) return null; let f = null; walk(a.stage, (o) => { if (f) return; if (!isVisible(o, a.stage)) return; if (isSoundTexture(textureName(o))) f = o; }); return f; }
+  function findSoundButton() {
+    const a = state.pixiApp;
+    if (!a) return null;
+    let f = null;
+    walk(a.stage, (o) => {
+      if (f) return;
+      if (!isVisible(o, a.stage)) return;
+      const fn = fullTextureName(o);
+      const tn = textureName(o);
+      if (isSoundTexture(tn) || isSoundTexture(fn) || /sound|speaker|audio/i.test(tn) || /sound|speaker|audio/i.test(fn)) {
+        let target = o;
+        if (!target.interactive && target.eventMode !== 'static' && target.eventMode !== 'dynamic' && target.parent) {
+          target = target.parent;
+        }
+        f = target;
+      }
+    });
+    return f;
+  }
   function isInMainArea(b) { if (!b) return false; return b.y > 60 && b.y < 420 && b.width < 600 && b.height < 400; }
   function collectMCOptions() {
     const a = state.pixiApp; if (!a) return []; const out = []; const seen = new Set();
@@ -1463,7 +1763,48 @@
     if (allOptions && allOptions.length > 1) for (const o of allOptions) { if (o === opt) continue; if (await attempt(o)) return true; }
     return false;
   }
-  function emitOnObject(o, ev) { if (!o || typeof o.emit !== 'function') return false; const f = { global: { x: 0, y: 0 }, target: o, currentTarget: o, stopped: false, stopPropagation() { this.stopped = true; } }; try { o.emit(ev, f); return true; } catch (_) { return false; } }
+  function emitOnObject(o, ev, pt) {
+    if (!o || typeof o.emit !== 'function') return false;
+    let p = pt && typeof pt.x === 'number' && typeof pt.y === 'number'
+      ? { x: pt.x, y: pt.y }
+      : null;
+    if (!p) {
+      const b = boundsOf(o);
+      p = b ? { x: b.x + b.width / 2, y: b.y + b.height / 2 } : { x: 0, y: 0 };
+    }
+    const getLocal = function(target) {
+      if (target && typeof target.toLocal === 'function') {
+        try { return target.toLocal(p); } catch (_) {}
+      }
+      return { x: p.x, y: p.y };
+    };
+    const interactionData = {
+      global: p,
+      client: p,
+      screen: p,
+      originalEvent: null,
+      getLocalPosition: getLocal
+    };
+    const syntheticEvent = {
+      data: interactionData,
+      global: p,
+      client: p,
+      screen: p,
+      target: o,
+      currentTarget: o,
+      type: ev,
+      stopped: false,
+      stopPropagation() { this.stopped = true; },
+      preventDefault() {},
+      getLocalPosition: getLocal
+    };
+    try {
+      o.emit(ev, syntheticEvent);
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
   function matchPromptToEntry(t) { const p = normaliseText(t); if (!p) return null;
     for (const e of state.vocab) { const w = normaliseText(e.word), o = normaliseText(e.originalWord); if (p === w || p === o) return e; }
     for (const e of state.vocab) { const w = normaliseText(e.word), o = normaliseText(e.originalWord); if (w && w.length > 3 && (p.includes(w) || w.includes(p))) return e; if (o && o.length > 3 && (p.includes(o) || o.includes(p))) return e; } return null; }
@@ -1472,23 +1813,78 @@
     if (w && p.includes(w)) return e.originalWord.trim(); if (o && p.includes(o)) return e.word.trim(); return e.originalWord.trim(); }
   async function mcListeningTick() {
     const { options: opts } = getMCOptionsAndPrompt();
-    const k = opts.map(o => o.label).join('|');
-    if (CONFIG.autoPlay && opts.length > 0 && !state.currentAnswer && state.lastPlayedKey !== k) {
-      const btn = findSoundButton();
-      if (btn) { state.lastPlayedKey = k; addLog('Auto-playing audio…'); const b = boundsOf(btn); if (b) { const p = worldToClient(b); if (p) { fireClickAt(p.x, p.y, '#4ade80'); await sleep(CONFIG.afterPlayMs); } } }
-    }
-    if (!state.currentAnswer) { setStatus('Waiting for audio…'); return; }
     if (opts.length === 0) { setStatus('Waiting for options…'); return; }
-    const key = k + '::' + (state.lastAudioUrl || ''); if (key === state.lastAnsweredKey) { setStatus('Answered'); return; }
-    const t = normaliseText(state.currentAnswer.word), e = normaliseText(state.currentAnswer.originalWord); const w = [t, e].filter(Boolean);
-    let m = null; for (const o of opts) if (w.includes(normaliseText(o.label))) { m = o; break; }
-    if (!m) for (const o of opts) { const n = normaliseText(o.label); for (const x of w) if (x && (n.includes(x) || x.includes(n)) && n.length > 1) { m = o; break; } if (m) break; }
-    if (!m) { addLog('No match for "' + w.join(' / ') + '"', 'err'); setStatus('No match'); return; }
+    const k = opts.map(o => o.label).join('|');
+
+    if (state.lastMCOptionsKey !== k) {
+      state.lastMCOptionsKey = k;
+      state.currentAnswer = null;
+      state.currentEntry = null;
+      state.lastAudioUrl = null;
+      state.lastPlayedKey = null;
+      setAudioLabel('');
+    }
+
+    const now = Date.now();
+    if (CONFIG.autoPlay && !state.currentAnswer) {
+      if (state.lastPlayedKey !== k || (now - (state.lastMCPlayAttemptAt || 0) > 2200)) {
+        const btn = findSoundButton();
+        if (btn) {
+          state.lastPlayedKey = k;
+          state.lastMCPlayAttemptAt = now;
+          addLog('Auto-playing audio…');
+          emitOnObject(btn, 'pointerup');
+          const b = boundsOf(btn);
+          if (b) {
+            const p = worldToClient(b);
+            if (p) fireClickAt(p.x, p.y, '#4ade80');
+          }
+          await sleep(CONFIG.afterPlayMs);
+        }
+      }
+    }
+
+    if (!state.currentAnswer) { setStatus('Waiting for audio…'); return; }
+    const key = k + '::' + (state.lastAudioUrl || '');
+    if (key === state.lastAnsweredKey) { setStatus('Answered'); return; }
+
+    const t = normaliseText(state.currentAnswer.word), e = normaliseText(state.currentAnswer.originalWord);
+    const w = [t, e].filter(Boolean);
+    let m = null;
+    for (const o of opts) {
+      if (w.includes(normaliseText(o.label))) { m = o; break; }
+    }
+    if (!m) {
+      for (const o of opts) {
+        const n = normaliseText(o.label);
+        for (const x of w) {
+          if (x && (n.includes(x) || x.includes(n)) && n.length > 1) { m = o; break; }
+        }
+        if (m) break;
+      }
+    }
+    if (!m) {
+      addLog('No match for "' + w.join(' / ') + '"', 'err');
+      setStatus('No match');
+      return;
+    }
+
     addLog(`Answering "${m.label}"`, 'ok');
     const ok = await tryClickMCOption(m, opts);
-    if (ok) { state.answeredCount++; setAnsweredCount(state.answeredCount); setStatus('Answered'); } else { addLog('✗ Click failed', 'err'); setStatus('Click failed'); }
-    state.lastAnsweredKey = key; await sleep(CONFIG.afterAnswerMs);
-    if (mcOptionsSignature() !== k) { state.currentAnswer = null; state.currentEntry = null; state.lastAudioUrl = null; setAudioLabel(''); }
+    if (ok) {
+      state.answeredCount++;
+      setAnsweredCount(state.answeredCount);
+      setStatus('Answered');
+    } else {
+      addLog('✗ Click failed', 'err');
+      setStatus('Click failed');
+    }
+    state.lastAnsweredKey = key;
+    await sleep(CONFIG.afterAnswerMs);
+    state.currentAnswer = null;
+    state.currentEntry = null;
+    state.lastAudioUrl = null;
+    setAudioLabel('');
   }
   async function mcReadingTick() {
     const { prompt: pc, options: opts } = getMCOptionsAndPrompt();
@@ -1984,8 +2380,8 @@
   }
 
   async function mc2ListeningTick() {
-    if (!state.vocab.length) {
-      setStatus('MC2 Listening: waiting for vocab');
+    if (!state.vocab.length && !state.sentences.length) {
+      setStatus('MC2 Listening: waiting for data');
       return;
     }
 
@@ -1997,13 +2393,23 @@
     }
 
     const sig = mc2Signature();
+    if (state.lastMC2Sig !== sig) {
+      state.lastMC2Sig = sig;
+      state.currentAnswer = null;
+      state.currentEntry = null;
+      state.lastAudioUrl = null;
+      state.lastPlayedKey = null;
+      setAudioLabel('');
+    }
 
+    const now = Date.now();
     if (!state.currentAnswer) {
-      if (CONFIG.autoPlay && state.lastPlayedKey !== `mc2:${sig}`) {
+      if (CONFIG.autoPlay && (state.lastPlayedKey !== `mc2:${sig}` || (now - (state.lastMC2PlayAttemptAt || 0) > 2200))) {
         const audio = mc2FindAudioButton();
 
         if (audio) {
           state.lastPlayedKey = `mc2:${sig}`;
+          state.lastMC2PlayAttemptAt = now;
           addLog('MC2: auto-playing audio…');
 
           const b = audio.bounds;
@@ -5561,9 +5967,32 @@
     return null;
   }
   function findTargetSentenceField(e, mf) {
-    const pr = ['sentence', 'secondaryWord', 'word', 'originalWord'];
-    for (const k of pr) { if (k === mf) continue; const v = e[k]; if (typeof v === 'string' && v.trim().length >= 3) return v.trim(); }
-    for (const k of Object.keys(e)) { if (k === mf) continue; const v = e[k]; if (typeof v === 'string' && v.trim().length >= 3) return v.trim(); }
+    if (!e) return '';
+    const pr = [
+      'originalSentence',
+      'sentence',
+      'translation',
+      'translatedSentence',
+      'targetSentence',
+      'secondaryWord',
+      'word',
+      'originalWord'
+    ];
+    for (const k of pr) {
+      if (k === mf) continue;
+      const v = e[k];
+      if (typeof v === 'string' && v.trim().length >= 1 && !/^\d+$/.test(v.trim())) {
+        return v.trim().replace(/<[^>]*>/g, '');
+      }
+    }
+    for (const k of Object.keys(e)) {
+      if (k === mf) continue;
+      if (/uid|id|audio|sound|module|feature|token|href|url|order|index|image|icon/i.test(k)) continue;
+      const v = e[k];
+      if (typeof v === 'string' && v.trim().length >= 1 && !/^\d+$/.test(v.trim())) {
+        return v.trim().replace(/<[^>]*>/g, '');
+      }
+    }
     return '';
   }
   async function pressFridgeSubmit() {
@@ -6572,12 +7001,37 @@
 
 
   // ============ OCEAN CLEANER / FISHING GAME ============
+  function oceanObjId(o) {
+    if (!o) return '';
+    if (!o.__lnOceanId) {
+      try {
+        Object.defineProperty(o, '__lnOceanId', {
+          configurable: true,
+          enumerable: false,
+          writable: false,
+          value: 'oc_' + Math.random().toString(36).slice(2)
+        });
+      } catch (_) {
+        o.__lnOceanId = 'oc_' + Math.random().toString(36).slice(2);
+      }
+    }
+    return o.__lnOceanId;
+  }
+
   function oceanHasContainerTexture(o) {
     let found = false;
 
     walk(o, (c) => {
       if (found) return;
-      if (/games\/fishing\/containers\/container_\d+/i.test(fullTextureName(c))) {
+      const full = fullTextureName(c);
+      const name = textureName(c);
+      if (
+        /(?:games\/)?(?:fishing|ocean)\/(?:containers?\/)?container/i.test(full) ||
+        /container_\d+/i.test(full) ||
+        /container_\d+/i.test(name) ||
+        /^container/i.test(name) ||
+        /(?:games\/)?(?:fishing|ocean)\/.*container/i.test(full)
+      ) {
         found = true;
       }
     });
@@ -6599,9 +7053,8 @@
       const b = boundsOf(o);
       if (!b) return;
 
-      // The real Ocean Cleaner answer containers in the dump are roughly
-      // 85–95px wide and 55–66px tall. Keep some headroom for other boards.
-      if (b.width < 55 || b.width > 180 || b.height < 35 || b.height > 110) return;
+      // Generous container size range to handle 1-letter words up to multi-word phrases.
+      if (b.width < 20 || b.width > 600 || b.height < 15 || b.height > 180) return;
 
       const texts = [];
 
@@ -6625,12 +7078,15 @@
         : [];
 
       raw.push({
+        id: oceanObjId(o),
         obj: o,
         label,
         bounds: b,
         events,
         direct:
           events.includes('pointerup') ||
+          events.includes('pointerdown') ||
+          events.includes('pointertap') ||
           events.includes('click') ||
           events.includes('tap')
       });
@@ -6644,12 +7100,13 @@
       const cy = c.bounds.y + c.bounds.height / 2;
 
       const dup = out.find(x => {
+        if (x.id && c.id && x.id === c.id) return true;
         if (chunkKey(x.label) !== chunkKey(c.label)) return false;
 
         const xx = x.bounds.x + x.bounds.width / 2;
         const xy = x.bounds.y + x.bounds.height / 2;
 
-        return Math.abs(xx - cx) < 12 && Math.abs(xy - cy) < 12;
+        return Math.abs(xx - cx) < 15 && Math.abs(xy - cy) < 15;
       });
 
       if (!dup) {
@@ -6665,7 +7122,8 @@
 
   function findOceanPrompt() {
     const a = state.pixiApp;
-    if (!a || !state.sentences.length) return null;
+    if (!a) return null;
+    if (state.sentences.length === 0 && state.vocab.length === 0) return null;
 
     const candidates = [];
 
@@ -6674,20 +7132,35 @@
       if (!isVisible(o, a.stage)) return;
 
       const text = o.text.trim();
-      const sm = matchPromptToSentence(text);
-      if (!sm) return;
+      let match = null;
+      let isVocab = false;
+
+      // Check sentences first, then vocab entries
+      if (state.sentences.length > 0) {
+        match = matchPromptToSentence(text);
+      }
+      if (!match && state.vocab.length > 0) {
+        const ve = matchPromptToEntry(text);
+        if (ve) {
+          match = { entry: ve, matchedField: 'vocab' };
+          isVocab = true;
+        }
+      }
+
+      if (!match) return;
 
       const b = boundsOf(o);
-      if (!b || b.width < 80 || b.height <= 0) return;
+      if (!b || b.width < 10 || b.height <= 0) return;
 
-      // Dump: Ocean Cleaner prompt is the sentence across the top at y≈77.
-      if (b.y < 45 || b.y > 135) return;
+      // Prompts appear across the upper portion of the game board.
+      if (b.y < 10 || b.y > 260) return;
 
       candidates.push({
         obj: o,
         text,
         bounds: b,
-        match: sm
+        match,
+        isVocab
       });
     });
 
@@ -6701,9 +7174,34 @@
     return candidates[0];
   }
 
+  function resolveOceanTarget(prompt) {
+    if (!prompt) return '';
+    if (prompt.isVocab && prompt.match && prompt.match.entry) {
+      return computeReadingAnswer(prompt.match.entry, prompt.text);
+    }
+    const sm = prompt.match;
+    if (sm && sm.entry) {
+      const target = findTargetSentenceField(sm.entry, sm.matchedField);
+      if (target) return target;
+    }
+    // Fallback: check vocab
+    if (state.vocab.length > 0) {
+      const ve = matchPromptToEntry(prompt.text);
+      if (ve) return computeReadingAnswer(ve, prompt.text);
+    }
+    // Fallback: check sentences
+    if (state.sentences.length > 0) {
+      const se = matchPromptToSentence(prompt.text);
+      if (se) return findTargetSentenceField(se.entry, se.matchedField);
+    }
+    return '';
+  }
+
   function buildOceanOrder(target, containers) {
     const targetSeq = chunkKey(target);
     if (!targetSeq) return [];
+
+    const targetSeqLower = targetSeq.toLowerCase();
 
     const pool = (containers || [])
       .map((c, index) => ({
@@ -6726,11 +7224,19 @@
       if (memo.has(memoKey)) return null;
 
       const candidates = pool
-        .filter(c =>
-          !used.has(c._index) &&
-          targetSeq.startsWith(c._norm, pos)
-        )
-        .sort((a, b) => b._norm.length - a._norm.length);
+        .filter(c => {
+          if (used.has(c._index)) return false;
+          if (pos + c._norm.length > targetSeq.length) return false;
+          const slice = targetSeqLower.slice(pos, pos + c._norm.length);
+          return slice === c._norm.toLowerCase();
+        })
+        .sort((a, b) => {
+          // Prefer exact-case match over case-insensitive match
+          const aExact = targetSeq.slice(pos, pos + a._norm.length) === a._norm ? 1 : 0;
+          const bExact = targetSeq.slice(pos, pos + b._norm.length) === b._norm ? 1 : 0;
+          if (aExact !== bExact) return bExact - aExact;
+          return b._norm.length - a._norm.length;
+        });
 
       for (const c of candidates) {
         const nextUsed = new Set(used);
@@ -6741,6 +7247,7 @@
         if (rest !== null) {
           return [
             {
+              id: c.id,
               obj: c.obj,
               label: c.label,
               bounds: c.bounds,
@@ -6760,16 +7267,14 @@
     if (!solved) return [];
 
     const rebuilt = solved.map(c => chunkKey(c.label)).join('');
-    return rebuilt === targetSeq ? solved : [];
+    return rebuilt.toLowerCase() === targetSeqLower ? solved : [];
   }
 
   function oceanContainerKey(c) {
-    if (!c || !c.bounds) return '';
-
-    return (
-      `${chunkKey(c.label)}@` +
-      `${Math.round(c.bounds.x)}:${Math.round(c.bounds.y)}`
-    );
+    if (!c) return '';
+    const id = c.id || (c.obj ? oceanObjId(c.obj) : '');
+    const b = c.bounds || {};
+    return `${id}|${chunkKey(c.label)}@${Math.round(b.x || 0)}:${Math.round(b.y || 0)}`;
   }
 
   function tryBuildOceanOrder(target) {
@@ -6796,6 +7301,32 @@
     setProgress(0, 0);
   }
 
+  function findOceanNextButton() {
+    const a = state.pixiApp;
+    if (!a) return null;
+    let found = null;
+    walk(a.stage, (o) => {
+      if (found) return;
+      if (!isVisible(o, a.stage)) return;
+      const f = fullTextureName(o);
+      const n = textureName(o);
+      if (
+        /nextQuestionButton/i.test(f) ||
+        /nextQuestionButton/i.test(n) ||
+        /continueButton/i.test(f) ||
+        /continueButton/i.test(n) ||
+        /submitButton/i.test(f)
+      ) {
+        found = o;
+        return;
+      }
+      if (typeof o.text === 'string' && /^(?:next|continue|submit)!?$/i.test(o.text.trim())) {
+        found = o;
+      }
+    });
+    return found;
+  }
+
   async function clickOceanContainer(container) {
     if (!container || !container.bounds) return false;
 
@@ -6805,56 +7336,74 @@
 
     addLog(
       `Ocean click "${container.label}" @ ${x|0},${y|0} ` +
-      `[${container.direct ? 'pointerup' : 'canvas'}]`
+      `[direct=${container.direct ? 'yes' : 'no'}]`
     );
 
-    // The dump shows the container wrapper itself has pointerup.
-    if (
-      container.direct &&
-      container.obj &&
-      typeof container.obj.emit === 'function'
-    ) {
-      try {
-        container.obj.emit(
-          'pointerup',
-          makeVerbEvent(container.obj, 'pointerup')
-        );
-        return true;
-      } catch (e) {
-        log('Ocean direct pointerup failed', e);
+    // 1) Direct PIXI emission on the container, its parent, and interactive children
+    const evs = ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'pointertap', 'click', 'tap'];
+    const targets = [];
+    if (container.obj) targets.push(container.obj);
+    if (container.obj && container.obj.parent) targets.push(container.obj.parent);
+    if (container.obj && Array.isArray(container.obj.children)) {
+      for (const child of container.obj.children) {
+        if (child && (child.interactive === true || child.eventMode === 'static' || child.eventMode === 'dynamic')) {
+          targets.push(child);
+        }
       }
     }
 
-    return safeCanvasPointerClickWorld(x, y, '#38bdf8', 18);
+    for (const target of targets) {
+      if (typeof target.emit === 'function') {
+        for (const evName of evs) {
+          try {
+            target.emit(evName, makeVerbEvent(target, evName));
+          } catch (_) {}
+        }
+      }
+    }
+
+    // 2) Full Canvas event dispatch (fires PointerEvent AND MouseEvent sequence)
+    const pt = worldToClient(b);
+    if (pt) {
+      fireClickAt(pt.x, pt.y, '#38bdf8');
+    } else {
+      await safeCanvasPointerClickWorld(x, y, '#38bdf8', 18);
+    }
+
+    return true;
   }
 
   function oceanContainerMovedOrGone(before, afterContainers) {
     if (!before) return false;
 
-    const beforeKey = oceanContainerKey(before);
+    // Check by persistent object ID first
+    if (before.id) {
+      const match = afterContainers.find(c => c.id === before.id);
+      if (!match) return true; // Object was removed from container list
 
-    if (!afterContainers.some(c => oceanContainerKey(c) === beforeKey)) {
-      return true;
+      const dx = Math.abs(match.bounds.x - before.bounds.x);
+      const dy = Math.abs(match.bounds.y - before.bounds.y);
+      if (dx > 15 || dy > 15) return true; // Object moved significantly
     }
 
-    // Same label but significantly different position also means the game moved it.
-    const sameLabel = afterContainers.filter(
-      c => chunkKey(c.label) === chunkKey(before.label)
-    );
+    // Check count of containers with this label
+    const labelKey = chunkKey(before.label);
+    const beforeLabelCount = (state.oceanOrder || []).filter(c => chunkKey(c.label) === labelKey).length;
+    const afterLabelCount = afterContainers.filter(c => chunkKey(c.label) === labelKey).length;
+    if (afterLabelCount < beforeLabelCount) return true;
 
-    for (const c of sameLabel) {
-      const dx = Math.abs(c.bounds.x - before.bounds.x);
-      const dy = Math.abs(c.bounds.y - before.bounds.y);
-
-      if (dx > 20 || dy > 20) return true;
+    // Fallback: check if the exact position has emptied
+    const beforeKey = oceanContainerKey(before);
+    if (!afterContainers.some(c => oceanContainerKey(c) === beforeKey)) {
+      return true;
     }
 
     return false;
   }
 
   async function oceanCleanerTick() {
-    if (!state.sentences.length) {
-      setStatus('Ocean Cleaner: waiting for sentence data');
+    if (state.sentences.length === 0 && state.vocab.length === 0) {
+      setStatus('Ocean Cleaner: waiting for data');
       return;
     }
 
@@ -6867,13 +7416,10 @@
 
     setPromptLabel(prompt.text);
 
-    const sm = prompt.match || matchPromptToSentence(prompt.text);
-    const target = sm
-      ? findTargetSentenceField(sm.entry, sm.matchedField)
-      : '';
+    const target = resolveOceanTarget(prompt);
 
     if (!target) {
-      setStatus('Ocean Cleaner: prompt not in sentence data');
+      setStatus('Ocean Cleaner: prompt not in data');
       return;
     }
 
@@ -6920,9 +7466,28 @@
     const expected = state.oceanOrder.length;
 
     if (state.oceanPickedCount >= expected) {
-      setStatus('Ocean Cleaner: waiting for next sentence');
+      setStatus('Ocean Cleaner: sentence completed');
       setProgress(expected, expected);
+
+      // Check if there is a Next/Continue button to advance
+      const nextBtn = findOceanNextButton();
+      if (nextBtn) {
+        const nb = boundsOf(nextBtn);
+        if (nb) {
+          const pt = worldToClient(nb);
+          if (pt) fireClickAt(pt.x, pt.y, '#4ade80');
+        }
+      }
+
       await sleep(CONFIG.oceanAfterRoundMs);
+
+      // Check if prompt has changed
+      const currentPrompt = findOceanPrompt();
+      if (!currentPrompt || normaliseText(currentPrompt.text) !== normaliseText(prompt.text)) {
+        state.oceanLastPrompt = null;
+        state.oceanOrder = [];
+        state.oceanPickedCount = 0;
+      }
       return;
     }
 
@@ -6939,14 +7504,13 @@
 
     let candidates = live.filter(c =>
       chunkKey(c.label) === wantedKey &&
-      !state.oceanUsedKeys.has(oceanContainerKey(c))
+      !state.oceanUsedKeys.has(c.id || oceanContainerKey(c))
     );
 
     if (!candidates.length) {
-      // If the exact source disappeared between ticks, treat that as a
-      // successful pickup and continue.
+      // If the container disappeared between ticks, treat as collected
       const stillVisible = live.some(
-        c => chunkKey(c.label) === wantedKey
+        c => chunkKey(c.label) === wantedKey && !state.oceanUsedKeys.has(c.id || oceanContainerKey(c))
       );
 
       if (!stillVisible) {
@@ -6973,7 +7537,7 @@
     });
 
     const next = candidates[0];
-    const key = oceanContainerKey(next);
+    const key = next.id || oceanContainerKey(next);
 
     const now = Date.now();
     if (now - state.oceanLastClickAt < CONFIG.oceanClickDelayMs) return;
@@ -6993,28 +7557,33 @@
       return;
     }
 
-    await sleep(CONFIG.oceanMoveSettleMs);
+    // Dynamic poll for container movement or consumption (up to 800ms, or faster with fastAnimations)
+    const maxWaitMs = state.fastAnimations ? 150 : 800;
+    const pollInterval = state.fastAnimations ? 30 : 80;
+    const startTime = Date.now();
+    let accepted = false;
 
-    let after = collectOceanContainers();
-    let accepted = oceanContainerMovedOrGone(next, after);
+    while (Date.now() - startTime < maxWaitMs) {
+      await sleep(pollInterval);
+      const after = collectOceanContainers();
+      if (oceanContainerMovedOrGone(next, after)) {
+        accepted = true;
+        break;
+      }
+    }
 
-    // If direct PIXI pointerup did not move/remove it, try a real canvas click
-    // at the exact same container.
-    if (!accepted && next.direct) {
-      const b = next.bounds;
-      const x = b.x + b.width / 2;
-      const y = b.y + b.height / 2;
-
-      addLog(`Ocean canvas retry: "${next.label}"`);
-
-      await safeCanvasPointerClickWorld(x, y, '#38bdf8', 18);
-      await sleep(CONFIG.oceanMoveSettleMs);
-
-      after = collectOceanContainers();
+    // If still not moved, try a second click attempt with canvas
+    if (!accepted) {
+      const pt = worldToClient(next.bounds);
+      if (pt) fireClickAt(pt.x, pt.y, '#38bdf8');
+      await sleep(state.fastAnimations ? 100 : 300);
+      const after = collectOceanContainers();
       accepted = oceanContainerMovedOrGone(next, after);
     }
 
-    if (!accepted) {
+    // Even if movement wasn't detected by position delta (e.g. animated in place or faded),
+    // if fails are accumulating, advance rather than hanging forever.
+    if (!accepted && state.oceanFails < 2) {
       state.oceanFails++;
       addLog(
         `? Ocean container did not move: "${next.label}"`,
@@ -8876,6 +9445,8 @@
   }
 
   async function verbMatcherTick() {
+    if (await dismissStartDialog()) return;
+
     if (state.verbs.length === 0) {
       setStatus('Verb Matcher: waiting for verb data');
       return;
@@ -9027,14 +9598,14 @@
       if (!interactive) return;
 
       const b = boundsOf(o);
-      if (!b || b.width < 40 || b.height < 25 || b.width > 260 || b.height > 180) return;
+      if (!b || b.width < 30 || b.height < 15 || b.width > 500 || b.height > 400) return;
 
       // Prefer objects that are, contain, or sit around a jigsaw piece texture.
       const kind = jigsawTextureKind(o);
       const nearPieceShape =
         kind === 'piece' ||
         kind === 'correct' ||
-        (b.width >= 70 && b.width <= 180 && b.height >= 60 && b.height <= 160);
+        (b.width >= 35 && b.width <= 350 && b.height >= 25 && b.height <= 300);
 
       if (!nearPieceShape) return;
       if (!includeCorrect && kind === 'correct') return;
@@ -9162,7 +9733,7 @@
   }
 
   function verbSections(entry) {
-    const raw = String(entry && entry.other || '');
+    const raw = String(entry && (entry.otherData || entry.other) || '');
     const out = [];
     const rx = /<section>([\s\S]*?)<\/section>/gi;
     let m;
@@ -9340,7 +9911,10 @@
 
   function bluePieceMatchesEntry(piece, entry) {
     if (!piece || !entry) return false;
-    if (verbKey(piece.label) !== verbKey(entry.translatedVerb)) return false;
+    const pk = verbKey(piece.label);
+    const matchesTrans = pk === verbKey(entry.translatedVerb);
+    const matchesOrig = pk === verbKey(entry.originalVerb);
+    if (!matchesTrans && !matchesOrig) return false;
 
     const prefixes = jigsawPrefixSections(entry).map(jigsawVerbKey).filter(Boolean);
     if (!prefixes.length) return true;
@@ -9353,8 +9927,9 @@
     });
 
     // Some wrappers only expose the translated label. In that case the API
-    // translatedVerb match is still authoritative.
-    const nonEnglish = found.filter(k => k && k !== jigsawVerbKey(entry.translatedVerb));
+    // translatedVerb / originalVerb match is still authoritative.
+    const expectedKey = matchesTrans ? jigsawVerbKey(entry.translatedVerb) : jigsawVerbKey(entry.originalVerb);
+    const nonEnglish = found.filter(k => k && k !== expectedKey);
     if (!nonEnglish.length) return true;
 
     return prefixes.every(k => nonEnglish.includes(k));
@@ -9382,10 +9957,6 @@
     if (!pieces.length) return [];
 
     const pieceBounds = pieces.map(p => p.bounds);
-    const minX = Math.min(...pieceBounds.map(b => b.x));
-    const maxX = Math.max(...pieceBounds.map(b => b.x + b.width));
-    const minY = Math.min(...pieceBounds.map(b => b.y));
-    const maxY = Math.max(...pieceBounds.map(b => b.y + b.height));
 
     const endingKeys = new Set();
     for (const v of state.verbs) {
@@ -9402,13 +9973,6 @@
 
       // The white endings are outside the blue-piece rectangles.
       if (pieceBounds.some(pb => rectContains(pb, bit.bounds, 5))) continue;
-
-      const cy = bit.bounds.y + bit.bounds.height / 2;
-      if (cy < minY - 20 || cy > maxY + 20) continue;
-
-      // Keep candidates around the Jigsaw board, not unrelated page text.
-      const cx = bit.bounds.x + bit.bounds.width / 2;
-      if (cx < minX - 120 || cx > maxX + 120) continue;
 
       const posKey = `${key}@${Math.round(bit.bounds.x)}:${Math.round(bit.bounds.y)}`;
       if (seen.has(posKey)) continue;
@@ -9451,14 +10015,48 @@
   }
 
   async function clickJigsawTarget(target) {
-    if (!target || !target.bounds) return false;
+    if (!target) return false;
+    const o = target.obj || target.textObj;
+    const b = target.bounds || (o ? boundsOf(o) : null);
+    if (!b) return false;
 
-    const b = target.bounds;
-    const x = b.x + b.width / 2;
-    const y = b.y + b.height / 2;
+    const wx = b.x + b.width / 2;
+    const wy = b.y + b.height / 2;
+    const pt = { x: wx, y: wy };
 
-    addLog(`Click white ${JSON.stringify(target.label)} @ ${x|0},${y|0}`);
-    return safeCanvasPointerClickWorld(x, y, '#ffb45c', 12);
+    addLog(`Click white ${JSON.stringify(target.label)} @ ${wx|0},${wy|0} (${b.width|0}x${b.height|0})`);
+
+    // 1) Canvas-level full pointer sequence (PixiJS hit-tests from these)
+    await safeCanvasPointerClickWorld(wx, wy, '#ffb45c', 30);
+
+    // 2) Direct emit on the display object with proper down→wait→up
+    if (o) {
+      emitOnObject(o, 'pointerover', pt);
+      emitOnObject(o, 'pointermove', pt);
+      emitOnObject(o, 'pointerdown', pt);
+      emitOnObject(o, 'mousedown', pt);
+      await sleep(20);
+      emitOnObject(o, 'pointerup', pt);
+      emitOnObject(o, 'mouseup', pt);
+      emitOnObject(o, 'click', pt);
+      emitOnObject(o, 'pointertap', pt);
+      emitOnObject(o, 'tap', pt);
+    }
+
+    // 3) Also emit on textObj if different from clickObj
+    if (target.textObj && target.textObj !== o) {
+      emitOnObject(target.textObj, 'pointerdown', pt);
+      await sleep(10);
+      emitOnObject(target.textObj, 'pointerup', pt);
+      emitOnObject(target.textObj, 'click', pt);
+      emitOnObject(target.textObj, 'pointertap', pt);
+    }
+
+    // 4) Also fire via clickTile (canvas mouse events at client coords)
+    await clickTile(o);
+    await sleep(10);
+
+    return true;
   }
 
 
@@ -9533,7 +10131,8 @@
   async function clickJigsawPiece(piece) {
     if (!piece) return false;
 
-    const b = piece.bounds || (piece.obj ? boundsOf(piece.obj) : null);
+    const o = piece.obj || piece;
+    const b = piece.bounds || (o ? boundsOf(o) : null);
     if (!b) return false;
 
     if (b.width > 260 || b.height > 190 || b.width < 30 || b.height < 20) {
@@ -9544,11 +10143,34 @@
       return false;
     }
 
-    const x = b.x + b.width / 2;
-    const y = b.y + b.height / 2;
+    const wx = b.x + b.width / 2;
+    const wy = b.y + b.height / 2;
+    const pt = { x: wx, y: wy };
 
-    addLog(`Click blue @ ${x|0},${y|0}`);
-    return safeCanvasPointerClickWorld(x, y, '#4ade80', 12);
+    addLog(`Click blue @ ${wx|0},${wy|0} (${b.width|0}x${b.height|0})`);
+
+    // 1) Canvas-level full pointer sequence (PixiJS hit-tests from these)
+    await safeCanvasPointerClickWorld(wx, wy, '#4ade80', 30);
+
+    // 2) Direct emit on the display object with proper down→wait→up
+    if (o) {
+      emitOnObject(o, 'pointerover', pt);
+      emitOnObject(o, 'pointermove', pt);
+      emitOnObject(o, 'pointerdown', pt);
+      emitOnObject(o, 'mousedown', pt);
+      await sleep(20);
+      emitOnObject(o, 'pointerup', pt);
+      emitOnObject(o, 'mouseup', pt);
+      emitOnObject(o, 'click', pt);
+      emitOnObject(o, 'pointertap', pt);
+      emitOnObject(o, 'tap', pt);
+    }
+
+    // 3) Also fire via clickTile (canvas mouse events at client coords)
+    await clickTile(o);
+    await sleep(10);
+
+    return true;
   }
 
 
@@ -9716,13 +10338,16 @@
     if (marker) showClickMarker(cx, cy, marker);
 
     try {
-      // Canvas pointer sequence only. No DOM click(), no PIXI .emit(),
-      // no parent-container guessing.
       firePointerEvent(c, 'pointerover', cx, cy, 0);
       firePointerEvent(c, 'pointermove', cx, cy, 0);
+      c.dispatchEvent(new MouseEvent('mouseover', { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy }));
+      c.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy }));
       firePointerEvent(c, 'pointerdown', cx, cy, 1);
-      await sleep(12);
+      c.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy, button: 0, buttons: 1 }));
+      await sleep(20);
       firePointerEvent(c, 'pointerup', cx, cy, 0);
+      c.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy }));
+      c.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy }));
       await sleep(settleMs == null ? CONFIG.clickSettleMs : settleMs);
       return true;
     } catch (e) {
@@ -9828,237 +10453,603 @@
     return { chosen: null, ranked: [], mode: 'none' };
   }
 
-  async function jigsawTick() {
-    // Re-apply the 1× exception immediately before every Jigsaw interaction.
-    // This prevents a previously active 4× ticker/tween speed from carrying
-    // into the first blue/white click pair.
-    applyAnimationSpeed();
-
-    if (state.verbs.length === 0) {
-      setStatus('Jigsaw: waiting for verb data');
-      return;
-    }
-
-    const pieces = collectJigsawPieces(false);
-    const endings = collectJigsawTargets();
-
-    if (!pieces.length) {
-      setStatus('Jigsaw: waiting for blue pieces');
-      return;
-    }
-
-    if (!endings.length) {
-      setStatus('Jigsaw: waiting for white endings');
-      return;
-    }
-
-    const valid = state.verbs.filter(v =>
-      v && v.originalVerb && v.translatedVerb && jigsawFinalSection(v)
-    );
-
-    setProgress(state.jigsawDone.size, valid.length);
-
-    let pair = null;
-
-    for (const entry of valid) {
-      const uid = String(entry.uid || (jigsawVerbKey(entry.originalVerb) + '|' + verbKey(entry.translatedVerb)));
-      if (state.jigsawDone.has(uid)) continue;
-
-      const piece = pieces.find(p => bluePieceMatchesEntry(p, entry));
-      if (!piece) continue;
-
-      const wantedEnding = jigsawFinalSection(entry);
-      const wantedKey = jigsawVerbKey(wantedEnding);
-      const rejected = rejectedEndingSet(uid);
-
-      let candidates = endings.filter(t =>
-        t.key === wantedKey &&
-        !state.jigsawUsedTargetPositions.some(u => {
-          const cx = t.bounds.x + t.bounds.width / 2;
-          const cy = t.bounds.y + t.bounds.height / 2;
-          return Math.abs(u.x - cx) < 24 && Math.abs(u.y - cy) < 24;
-        }) &&
-        !rejected.has(jigsawEndingKey(t))
-      );
-
-      if (!candidates.length) {
-        // If every identical ending was rejected/used, allow unused exact-text
-        // endings again; this is safer than guessing a different suffix.
-        candidates = endings.filter(t =>
-          t.key === wantedKey &&
-          !state.jigsawUsedTargetPositions.some(u => {
-            const cx = t.bounds.x + t.bounds.width / 2;
-            const cy = t.bounds.y + t.bounds.height / 2;
-            return Math.abs(u.x - cx) < 24 && Math.abs(u.y - cy) < 24;
-          })
-        );
-      }
-
-      if (!candidates.length) continue;
-
-      // Prefer the candidate that changed/appeared nearest the current board edge,
-      // but duplicate identical endings are tried one-by-one if rejected.
-      candidates.sort((a, b) => {
-        const ae = verbEventNames(a.obj).includes('pointerup') ? 0 : 1;
-        const be = verbEventNames(b.obj).includes('pointerup') ? 0 : 1;
-        if (ae !== be) return ae - be;
-        return a.bounds.y - b.bounds.y || a.bounds.x - b.bounds.x;
+  // JigsawController uses click-to-pick-up and click-to-place. Its blue bank
+  // piece displays <section>3</section>; a board slot displays sections 1+2.
+  function collectJigsawBoard() {
+    const a = state.pixiApp;
+    if (!a) return { pieces: [], slots: [] };
+    const pieces = [], slots = [];
+    walk(a.stage, o => {
+      if (!isVisible(o, a.stage)) return;
+      const events = verbEventNames(o);
+      const interactive = o.interactive === true ||
+        o.eventMode === 'static' || o.eventMode === 'dynamic' ||
+        events.some(name => /^(?:pointerup|pointertap|click|tap)$/i.test(name));
+      if (!interactive) return;
+      const b = boundsOf(o);
+      if (!b || b.width < 35 || b.height < 25 || b.width > 450 || b.height > 220) return;
+      const labels = [];
+      let hasBlue = false, hasSlot = false;
+      walk(o, child => {
+        const texture = `${fullTextureName(child)} ${textureName(child)}`;
+        if (/jigsawPiece(?:\.png)?/i.test(texture) && !/jigsawCorrectPiece/i.test(texture)) hasBlue = true;
+        if (/jigsawBackground/i.test(texture)) hasSlot = true;
+        if (typeof child.text === 'string' && child.text.trim() && isVisible(child, a.stage)) {
+          labels.push(child.text.trim());
+        }
       });
+      if (hasBlue && !hasSlot && labels.length) pieces.push({ obj: o, bounds: b, labels, key: jigsawVerbKey(labels[0]) });
+      if (hasSlot && !hasBlue && labels.length) {
+        const keys = [jigsawVerbKey(labels[0]), jigsawVerbKey((labels[0] || '') + (labels[1] || ''))];
+        const matches = state.verbs.filter(v => {
+          const sections = verbSections(v);
+          return sections.length >= 3 && keys.includes(jigsawVerbKey(sections[0] + sections[1]));
+        });
+        if (matches.length) {
+          // The third label is the interface-language word. It separates
+          // duplicate stems such as "sie hör" (she hears / they hear).
+          const translation = labels[2] || '';
+          const exact = matches.find(v => verbKey(v.translatedVerb) === verbKey(translation));
+          const entry = exact || matches[0];
+          slots.push({
+            obj: o, bounds: b, labels,
+            key: jigsawVerbKey(verbSections(entry)[0] + verbSections(entry)[1]),
+            entryUid: exact ? String(exact.uid || '') : ''
+          });
+        }
+      }
+    });
+    // Nested clickable wrappers can share one texture. Keep the closest match
+    // to each piece/slot's actual clickable container.
+    const unique = items => {
+      const out = [];
+      for (const item of items) {
+        const old = out.find(x => x.key === item.key &&
+          Math.abs(x.bounds.x - item.bounds.x) < 12 && Math.abs(x.bounds.y - item.bounds.y) < 12);
+        if (!old) out.push(item);
+        else if (verbEventNames(item.obj).length > verbEventNames(old.obj).length) Object.assign(old, item);
+      }
+      return out;
+    };
+    return { pieces: unique(pieces), slots: unique(slots) };
+  }
 
-      pair = { uid, entry, piece, ending: candidates[0], endingCandidates: candidates };
-      break;
+  function jigsawPieceInSlot(piece, slot) {
+    const p = boundsOf(piece.obj) || piece.bounds;
+    const b = boundsOf(slot.obj) || slot.bounds;
+    if (!p || !b) return false;
+    // JigsawController.placeInSlot snaps the container to slot.x + 222,
+    // slot.y + 8. The sprite bounds add ~11px horizontally. Tight matching
+    // keeps bank pieces from being mistaken for pieces in adjacent slots.
+    return Math.abs((p.x - b.x) - 233) <= 25 &&
+      Math.abs((p.y - b.y) - 8) <= 20;
+  }
+
+  function jigsawPlacedEntries(entries, board) {
+    const done = new Set();
+    const usedSlots = new Set();
+    const usedPieces = new Set();
+    // Resolve labelled slots first; otherwise duplicate stems could both
+    // claim a single placed piece.
+    const ordered = entries.slice().sort((a, b) => {
+      const ah = board.slots.some(s => s.entryUid === a.uid) ? 0 : 1;
+      const bh = board.slots.some(s => s.entryUid === b.uid) ? 0 : 1;
+      return ah - bh;
+    });
+    for (const item of ordered) {
+      for (const slot of board.slots) {
+        if (usedSlots.has(slot.obj) || slot.key !== item.slotKey ||
+            (slot.entryUid && slot.entryUid !== item.uid)) continue;
+        const piece = board.pieces.find(p => !usedPieces.has(p.obj) &&
+          p.key === item.pieceKey && jigsawPieceInSlot(p, slot));
+        if (!piece) continue;
+        usedSlots.add(slot.obj);
+        usedPieces.add(piece.obj);
+        done.add(item.uid);
+        break;
+      }
     }
+    return done;
+  }
 
+  async function activateJigsawObject(item) {
+    const events = verbEventNames(item.obj);
+    // LanguageNut attaches its click callback to both pointerup and keyup.
+    // pointerup is silently suppressed while the canvas is panning/resizing
+    // (for example when DevTools is docked), although Pixi.emit succeeds.
+    // keyup calls the same callback without that pan guard.
+    const event = ['keyup', 'pointerup', 'pointertap', 'click', 'tap']
+      .find(name => events.includes(name));
+    if (event) return emitOnObject(item.obj, event);
+    const b = boundsOf(item.obj) || item.bounds;
+    return !!b && safeCanvasPointerClickWorld(b.x + b.width / 2, b.y + b.height / 2, '#4ade80', 30);
+  }
+
+  async function jigsawTick() {
+    if (await dismissStartDialog()) return;
+    const entries = state.verbs.map(entry => {
+      const sections = verbSections(entry);
+      return sections.length >= 3 ? {
+        entry,
+        uid: String(entry.uid || `${jigsawVerbKey(sections[0] + sections[1])}|${jigsawVerbKey(sections[2])}`),
+        slotKey: jigsawVerbKey(sections[0] + sections[1]),
+        pieceKey: jigsawVerbKey(sections[2]),
+        label: `${sections[0]} ${sections[1]} ← ${sections[2]}`
+      } : null;
+    }).filter(Boolean);
+    if (!entries.length) {
+      setStatus('Jigsaw: waiting for section data');
+      return;
+    }
+    const board = collectJigsawBoard();
+    if (!board.slots.length || !board.pieces.length) {
+      setStatus(`Jigsaw: waiting for board (${board.pieces.length} pieces, ${board.slots.length} slots)`);
+      return;
+    }
+    // Rebuild progress from the live board, so reloads and already placed
+    // pieces do not cause duplicate clicks or stale counters.
+    const liveDone = jigsawPlacedEntries(entries, board);
+    state.jigsawDone = liveDone;
+    setProgress(state.jigsawDone.size, entries.length);
+    // A piece can be placed into the wrong duplicate-looking slot. Move it
+    // back to the bank before attempting another placement.
+    for (const slot of board.slots) {
+      if (!slot.entryUid) continue;
+      const expected = entries.find(item => item.uid === slot.entryUid);
+      const occupant = board.pieces.find(p => jigsawPieceInSlot(p, slot));
+      if (!expected || !occupant || occupant.key === expected.pieceKey) continue;
+      await activateJigsawObject(occupant);
+      addLog(`Jigsaw moved wrong piece ${occupant.labels[0]} out of ${slot.labels.slice(0, 2).join(' ')}`, 'err');
+      setStatus('Jigsaw: correcting occupied slot');
+      return;
+    }
+    let pair = null;
+    for (const item of entries) {
+      if (state.jigsawDone.has(item.uid)) continue;
+      const slot = board.slots.find(x => x.key === item.slotKey &&
+        (!x.entryUid || x.entryUid === item.uid) &&
+        !board.pieces.some(p => jigsawPieceInSlot(p, x)));
+      const piece = board.pieces.find(x => x.key === item.pieceKey &&
+        !board.slots.some(s => jigsawPieceInSlot(x, s)));
+      if (slot && piece) { pair = { item, slot, piece }; break; }
+    }
     if (!pair) {
-      if (state.jigsawDone.size >= valid.length) {
-        setStatus('Jigsaw: all pieces placed');
+      setStatus(state.jigsawDone.size >= entries.length
+        ? 'Jigsaw: all pieces placed' : 'Jigsaw: waiting for matching piece and slot');
+      return;
+    }
+    setPromptLabel(pair.item.label);
+    const picked = await activateJigsawObject(pair.piece);
+    if (!picked) {
+      setStatus('Jigsaw: piece click failed');
+      return;
+    }
+    // Give Pixi one frame to update selectedPiece and the selection tint.
+    await new Promise(resolve => setTimeout(resolve, 34));
+    const placed = await activateJigsawObject(pair.slot);
+    if (!placed) {
+      setStatus('Jigsaw: slot click failed');
+      return;
+    }
+    await new Promise(resolve => setTimeout(resolve, 34));
+    const afterDone = jigsawPlacedEntries(entries, collectJigsawBoard());
+    if (jigsawPieceInSlot(pair.piece, pair.slot) && afterDone.size > liveDone.size) {
+      state.jigsawDone = afterDone;
+      state.jigsawFails = 0;
+      state.answeredCount++;
+      setAnsweredCount(state.answeredCount);
+      setProgress(state.jigsawDone.size, entries.length);
+      addLog(`✓ Jigsaw ${state.jigsawDone.size}/${entries.length}: ${pair.item.label}`, 'ok');
+      setStatus('Jigsaw: placed');
+    } else {
+      state.jigsawFails++;
+      addLog(`Jigsaw placement not confirmed: ${pair.item.label}`, 'err');
+      setStatus('Jigsaw: retrying placement');
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+  }
+
+  // ============ ZEN MATCHING GAMES AND RACE DRIVER ============
+  function zenText(obj) {
+    return descendantTextFragments(obj).map(bit => bit.text.trim()).filter(Boolean).join(' ');
+  }
+
+  function zenTranslationMatch(learning, interfaceText) {
+    // This board uses vocab.word for each square and vocab.originalWord for
+    // each draggable tile. Sentences and vocab from a previous route can
+    // contain plausible but incorrect matches for the current board.
+    if (state.vocabRoute !== location.hash) return false;
+    const key = value => String(value || '').replace('ü', 'ü').replace('’', "'")
+      .replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
+    const square = key(learning), tile = key(interfaceText);
+    return !!square && !!tile && state.vocab.some(entry =>
+      key(entry.word) === square && key(entry.originalWord) === tile);
+  }
+
+  function zenMemoryBoard() {
+    const targets = [], cards = [];
+    walk(state.pixiApp.stage, obj => {
+      if (!isVisible(obj, state.pixiApp.stage) || typeof obj.name !== 'string') return;
+      if (obj.name.startsWith('zenMatchTile_')) targets.push(obj);
+      if (obj.name.startsWith('zenDragCard_')) cards.push(obj);
+    });
+    return {targets, cards};
+  }
+
+  async function zenMemoryTick() {
+    const {targets, cards} = zenMemoryBoard();
+    if (!targets.length || !cards.length) return setStatus('Matching Pairs: waiting for cards');
+    const done = targets.filter(obj => /correctMatch/i.test(fullTextureName(obj.children?.[0]))).length;
+    if (done < state.zenMemoryLastCount) state.zenMemoryLastCount = done;
+    if (done > state.zenMemoryLastCount) {
+      state.answeredCount += done - state.zenMemoryLastCount;
+      setAnsweredCount(state.answeredCount);
+      setProgress(done, targets.length);
+      state.zenMemoryLastCount = done;
+    }
+    const target = targets.find(obj => !/correctMatch/i.test(fullTextureName(obj.children?.[0])) &&
+      cards.some(card => isVisible(card, state.pixiApp.stage) &&
+        normaliseText(card.name.slice('zenDragCard_'.length)) ===
+        normaliseText(obj.name.slice('zenMatchTile_'.length))));
+    if (!target) return setStatus('Matching Pairs: waiting for unmatched cards');
+    const card = cards.find(obj => isVisible(obj, state.pixiApp.stage) &&
+      normaliseText(obj.name.slice('zenDragCard_'.length)) ===
+      normaliseText(target.name.slice('zenMatchTile_'.length)));
+    const label = card.name.slice('zenDragCard_'.length);
+    setPromptLabel(label);
+    emitOnObject(card, 'keyup');
+    await new Promise(resolve => setTimeout(resolve, 50));
+    emitOnObject(target, 'keyup');
+    await new Promise(resolve => setTimeout(resolve, 90));
+    if (/correctMatch/i.test(fullTextureName(target.children?.[0]))) {
+      const next = done + 1;
+      state.zenMemoryLastCount = next;
+      state.answeredCount++;
+      setAnsweredCount(state.answeredCount);
+      setProgress(next, targets.length);
+      addLog(`✓ Matching Pairs ${next}/${targets.length}: ${label}`, 'ok');
+    } else setStatus(`Matching Pairs: retrying ${label}`);
+  }
+
+  function zenNoughtsBoard() {
+    let group = null;
+    walk(state.pixiApp.stage, obj => {
+      if (group || !Array.isArray(obj.children) || obj.children.length < 18) return;
+      const cells = obj.children.slice(0, 9), tiles = obj.children.slice(9, 18);
+      if (cells.every(cell => zenText(cell)) && tiles.every(tile =>
+        verbEventNames(tile).includes('mousedown'))) group = {cells, tiles};
+    });
+    return group;
+  }
+
+  function zenNoughtsMark(cell) {
+    const marker = cell.children?.[5];
+    if (!marker || marker.visible === false) return '';
+    const name = fullTextureName(marker);
+    return /nought/i.test(name) ? 'o' : /cross/i.test(name) ? 'x' : '';
+  }
+
+  function zenNoughtsPriority(cells, index) {
+    const marks = cells.map(zenNoughtsMark);
+    const lines = [[0,1,2],[3,4,5],[6,7,8],[0,3,6],[1,4,7],[2,5,8],[0,4,8],[2,4,6]];
+    let score = index === 4 ? 6 : [0,2,6,8].includes(index) ? 4 : 2;
+    for (const line of lines.filter(line => line.includes(index))) {
+      const others = line.filter(i => i !== index).map(i => marks[i]);
+      if (others.every(mark => mark === 'x')) score += 100;
+      if (others.every(mark => mark === 'o')) score += 80;
+    }
+    return score;
+  }
+
+  async function zenNoughtsTick() {
+    const board = zenNoughtsBoard();
+    if (!board) return setStatus('Noughts & Crosses: waiting for board');
+    if (state.vocabRoute !== location.hash)
+      return setStatus('Noughts & Crosses: waiting for this board’s words');
+    if (Date.now() < state.zenNoughtsNextMoveAt)
+      return setStatus('Noughts & Crosses: waiting for turn');
+    const occupied = board.cells.filter(cell => !!zenNoughtsMark(cell)).length;
+    const playerCount = board.cells.filter(cell => zenNoughtsMark(cell) === 'x').length;
+    if (playerCount < state.zenNoughtsLastCount) state.zenNoughtsLastCount = playerCount;
+    if (playerCount > state.zenNoughtsLastCount) {
+      state.answeredCount += playerCount - state.zenNoughtsLastCount;
+      setAnsweredCount(state.answeredCount);
+      state.zenNoughtsLastCount = playerCount;
+      setProgress(occupied, 9);
+    }
+    const moves = board.cells.map((cell, index) => ({cell, index,
+      tile: board.tiles.find(tile => isVisible(tile, state.pixiApp.stage) &&
+        zenTranslationMatch(zenText(cell), zenText(tile)))}))
+      .filter(move => !zenNoughtsMark(move.cell) && move.tile)
+      .sort((a, b) => zenNoughtsPriority(board.cells, b.index) - zenNoughtsPriority(board.cells, a.index));
+    if (!moves.length) return setStatus('Noughts & Crosses: waiting for next turn');
+    const move = moves[0];
+    const tileLabel = zenText(move.tile);
+    setPromptLabel(`${tileLabel} → ${zenText(move.cell)}`);
+    const dragged = await dragTileTo(move.tile, move.cell);
+    if (!dragged) return setStatus('Noughts & Crosses: drag failed');
+    // The success marker appears only after the game's drag animation.
+    // Wait for that confirmation before choosing another tile.
+    const deadline = Date.now() + 2200;
+    while (!zenNoughtsMark(move.cell) && Date.now() < deadline)
+      await sleep(60);
+    if (zenNoughtsMark(move.cell)) {
+      state.zenNoughtsNextMoveAt = Date.now() + 3500;
+      state.zenNoughtsLastCount++;
+      state.answeredCount++;
+      setAnsweredCount(state.answeredCount);
+      setProgress(occupied + 1, 9);
+      addLog(`✓ Noughts & Crosses: ${tileLabel}`, 'ok');
+    } else {
+      state.zenNoughtsNextMoveAt = Date.now() + 1800;
+      setStatus('Noughts & Crosses: waiting to retry tile');
+    }
+  }
+
+  function raceDriverScene() {
+    const stage = state.pixiApp.stage;
+    let vehicle = null, obstacles = null, collected = null, prompt = '';
+    for (const obj of stage.children || []) {
+      if (/raceDriver\/vehicles\//i.test(fullTextureName(obj))) vehicle = obj;
+      // The game stores `lane` on its own CompositeGraphicsObject, but the
+      // PIXI.Container exposed here does not inherit that custom property.
+      // Its three rendered choices still sit at the fixed lane coordinates.
+      if (obj.children?.length && obj.children.every(child =>
+        typeof child.children?.[1]?.text === 'string' &&
+        [260, 360, 480].some(lane => Math.abs(child.y - lane) < 25)))
+        obstacles = obj.children;
+      if (obj.children?.length && obj.children.every(child =>
+        typeof child.text === 'string' && child.text.trim() &&
+        (boundsOf(child)?.y || 0) > 180 && (boundsOf(child)?.y || 0) < 330)) collected = obj.children;
+    }
+    const entry = state.sentences.find(sentence => {
+      const wanted = normaliseText(sentence.originalSentence);
+      if (!wanted) return false;
+      let found = false;
+      walk(stage, obj => { if (typeof obj.text === 'string' &&
+        normaliseText(obj.text) === wanted && isVisible(obj, stage)) found = true; });
+      return found;
+    });
+    if (entry) prompt = String(entry.originalSentence || '').trim();
+    return {vehicle, obstacles: obstacles || [], collected: collected || [], entry, prompt};
+  }
+
+  function raceDriverBoost(pressed, target) {
+    if (!pressed && !state.raceRightHeld) {
+      state.raceBoostTarget = null;
+      return;
+    }
+    const now = Date.now();
+    // RaceDriverGameController.sendObstacles() clears its ArrowRight key for
+    // every new group. Reassert keydown on a new rendered target and while
+    // holding, since the game can reset its key without a matching keyup.
+    if (pressed && state.raceRightHeld && state.raceBoostTarget === target &&
+        now - state.raceBoostAssertAt < 120) return;
+    const options = {key: 'ArrowRight', code: 'ArrowRight', bubbles: true, cancelable: true};
+    window.dispatchEvent(new KeyboardEvent(pressed ? 'keydown' : 'keyup', options));
+    state.raceRightHeld = pressed;
+    state.raceBoostTarget = pressed ? target : null;
+    state.raceBoostAssertAt = pressed ? now : 0;
+  }
+
+  async function raceDriverTick() {
+    const scene = raceDriverScene();
+    if (!scene.entry || !scene.vehicle) {
+      raceDriverBoost(false);
+      return setStatus('Race Driver: waiting for sentence');
+    }
+    const key = String(scene.entry.uid || scene.prompt);
+    if (key !== state.raceLastQuestion) {
+      raceDriverBoost(false);
+      state.raceLastQuestion = key;
+      state.raceLastChunks = 0;
+    }
+    const chunks = Array.isArray(scene.entry.chunks) ? scene.entry.chunks : [];
+    // A previous sentence's text can remain on screen during the transition.
+    // Count only chunks that match this sentence in order, and retain the
+    // confirmed count while the container animates out of the scan area.
+    let visibleCollected = 0;
+    for (const piece of scene.collected) {
+      if (normaliseText(piece.text) !== normaliseText(chunks[visibleCollected]?.text)) break;
+      visibleCollected++;
+    }
+    const collected = Math.min(chunks.length,
+      Math.max(visibleCollected, state.raceLastChunks));
+    if (collected > state.raceLastChunks) {
+      raceDriverBoost(false);
+      state.raceLastChunks = collected;
+      setProgress(collected, chunks.length);
+      addLog(`Race Driver collected ${collected}/${chunks.length}: ${chunks[collected - 1].text}`, 'ok');
+      if (collected === chunks.length) {
+        state.answeredCount++;
+        setAnsweredCount(state.answeredCount);
+      }
+    }
+    const wanted = chunks[collected] && normaliseText(chunks[collected].text);
+    if (!wanted) {
+      raceDriverBoost(false);
+      return setStatus('Race Driver: waiting for next sentence');
+    }
+    const obstacle = scene.obstacles.find(obj =>
+      normaliseText(obj.children?.[1]?.text) === wanted && !obj.hasProcessed);
+    if (!obstacle) {
+      raceDriverBoost(false);
+      return setStatus(`Race Driver: waiting for ${chunks[collected].text}`);
+    }
+    const obstacleWidth = obstacle.children?.[0]?.width || obstacle.width || 0;
+    if (obstacle.x + obstacleWidth < scene.vehicle.x) {
+      raceDriverBoost(false);
+      return setStatus(`Race Driver: missed ${chunks[collected].text}; waiting for retry`);
+    }
+    setPromptLabel(`${scene.prompt} → ${chunks[collected].text}`);
+    const delta = obstacle.y - scene.vehicle.y;
+    if (Math.abs(delta) <= 24) {
+      raceDriverBoost(true, obstacle);
+      return setStatus(`Race Driver: boosting toward ${chunks[collected].text}`);
+    }
+    raceDriverBoost(false);
+    const keyName = delta < 0 ? 'ArrowUp' : 'ArrowDown';
+    const options = {key: keyName, code: keyName, bubbles: true, cancelable: true};
+    window.dispatchEvent(new KeyboardEvent('keydown', options));
+    // Short pulses near the lane avoid jumping past it and alternating
+    // between Up and Down forever, which would prevent the boost.
+    await new Promise(resolve => setTimeout(resolve, Math.abs(delta) < 60 ? 25 : 70));
+    window.dispatchEvent(new KeyboardEvent('keyup', options));
+    setStatus(`Race Driver: steering ${keyName === 'ArrowUp' ? 'up' : 'down'} to ${chunks[collected].text}`);
+  }
+
+  // ============ SENTENCE DICTATION ============
+  function dictationInputVisible(input) {
+    if (!input || input.offsetParent === null) return false;
+    const style = getComputedStyle(input);
+    return style.display !== 'none' && style.visibility !== 'hidden' &&
+      Number(style.opacity) > 0;
+  }
+
+  function dictationPlayButton() {
+    let found = null;
+    walk(state.pixiApp.stage, obj => {
+      if (found || !isVisible(obj, state.pixiApp.stage) ||
+          !/who\/play/i.test(fullTextureName(obj))) return;
+      const bounds = boundsOf(obj);
+      if (bounds && bounds.width > 15 && bounds.height > 15 &&
+          verbEventNames(obj).includes('keyup')) found = obj;
+    });
+    return found;
+  }
+
+  async function dictationTick() {
+    const input = document.getElementById('textInputChina');
+    const visible = dictationInputVisible(input);
+    if (state.dictationSubmitted) {
+      if (!visible) state.dictationSawHidden = true;
+      if (!state.dictationSawHidden || !visible || String(input.value || '').trim()) {
+        setStatus('Dictation: waiting for next question');
         return;
       }
+      state.dictationSubmitted = false;
+      state.dictationSawHidden = false;
+      state.dictationPlayAt = 0;
+    }
+    if (!visible) return setStatus('Dictation: waiting for answer box');
+    if (!state.sentences.length) return setStatus('Dictation: waiting for sentence data');
 
-      state.jigsawFails++;
-      if (state.jigsawFails === 1 || state.jigsawFails % 8 === 0) {
-        addLog(`Jigsaw: no exact API blue+ending pair (blue=${pieces.length}, endings=${endings.length})`, 'err');
+    if (!state.dictationPlayAt) {
+      const play = dictationPlayButton();
+      if (play) {
+        emitOnObject(play, 'keyup');
+        state.dictationPlayAt = Date.now();
       }
-      setStatus('Jigsaw: exact pair not found');
-      await sleep(70);
+    }
+    const audio = String(window.languageNutPlayingSound?.url || '');
+    const entry = audio ? matchAudioToEntry(audio) : null;
+    if (!entry) {
+      if (Date.now() - state.dictationPlayAt > 1200) state.dictationPlayAt = 0;
+      return setStatus('Dictation: waiting for matching audio');
+    }
+    const answer = String(entry.sentence || entry.word || entry.learningWord || '').trim();
+    if (!answer) return setStatus('Dictation: no sentence for audio');
+    state.dictationLastAudio = audio;
+    setAudioLabel(baseName(audio));
+    setPromptLabel(answer);
+    wordPodSetNativeInputValue(input, answer);
+    wordPodDispatchInput(input, answer, 'insertText');
+    input.dispatchEvent(new Event('change', {bubbles: true}));
+    if (String(input.value || '').normalize('NFC') !== answer.normalize('NFC'))
+      return setStatus('Dictation: answer input failed');
+
+    state.dictationSubmitted = true;
+    try {
+      if (typeof window.onkeyup === 'function') window.onkeyup({keyCode: 13});
+      else window.dispatchEvent(new KeyboardEvent('keyup',
+        {key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true}));
+    } catch (error) {
+      state.dictationSubmitted = false;
+      throw error;
+    }
+    await new Promise(resolve => setTimeout(resolve, 80));
+    if (dictationInputVisible(input) && String(input.value || '') === answer) {
+      state.dictationSubmitted = false;
+      return setStatus('Dictation: submit not accepted, retrying');
+    }
+    state.dictationSawHidden = !dictationInputVisible(input);
+    state.answeredCount++;
+    setAnsweredCount(state.answeredCount);
+    setProgress(state.answeredCount - state.fakeTimeAnswerBase, state.sentences.length);
+    addLog(`✓ Dictation: ${answer}`, 'ok');
+    setStatus('Dictation: submitted — waiting for next question');
+  }
+
+  // ============ A-LEVEL PHOTO EXAM ============
+  function photoExamAnswer(question) {
+    const image = String(question?.image || '');
+    // This image was verified on the live A-Level Photo page. The API returns
+    // an image and an unrelated reading passage, not a model photo answer.
+    if (image === 'a6239.jpg') {
+      return 'Auf dem Foto sehe ich eine junge Frau draußen in der Stadt. Sie trägt Kopfhörer und hört wahrscheinlich Musik. Sie lächelt und scheint sehr glücklich zu sein. Im Hintergrund sehe ich Gebäude und andere Menschen. Vielleicht hört sie ihr Lieblingslied auf ihrem Handy. Ich höre auch gern Musik, besonders wenn ich unterwegs bin, weil sie meine Stimmung verbessert.';
+    }
+    const lang = String(question?.ietf || sessionStorage.getItem('learningLanguage') || '').toLowerCase();
+    if (lang.startsWith('de')) return 'Auf dem Foto sehe ich eine Alltagsszene. Im Vordergrund gibt es etwas Interessantes zu sehen, und im Hintergrund sind weitere Details. Die Atmosphäre wirkt angenehm. Vielleicht verbringen die Menschen hier Zeit zusammen. Meiner Meinung nach ist dieses Bild interessant, weil es etwas über das tägliche Leben zeigt.';
+    if (lang.startsWith('fr')) return 'Sur la photo, je vois une scène de la vie quotidienne. Au premier plan, il y a quelque chose d’intéressant et, à l’arrière-plan, on distingue d’autres détails. L’ambiance semble agréable. À mon avis, cette image montre un moment de la vie de tous les jours.';
+    if (lang.startsWith('es')) return 'En la foto veo una escena de la vida cotidiana. En primer plano hay algo interesante y al fondo se pueden ver más detalles. El ambiente parece agradable. En mi opinión, esta imagen muestra un momento de la vida diaria.';
+    if (lang.startsWith('it')) return 'Nella foto vedo una scena di vita quotidiana. In primo piano c’è qualcosa di interessante e sullo sfondo si vedono altri dettagli. L’atmosfera sembra piacevole. Secondo me, questa immagine mostra un momento della vita di tutti i giorni.';
+    return 'In the photo I can see a scene from everyday life. There are details in both the foreground and the background. The atmosphere seems pleasant. In my opinion, the image shows a moment from daily life.';
+  }
+
+  async function examPhotoTick() {
+    if (await dismissStartDialog()) return;
+    const match = location.href.match(/[?&]examUid=(\d+)/i);
+    const uid = match ? match[1] : '';
+    const question = state.examPhotoQuestion && (!uid || String(state.examPhotoQuestion.uid) === uid)
+      ? state.examPhotoQuestion : {uid, image: uid ? `a${uid}.jpg` : '', ietf: sessionStorage.getItem('learningLanguage')};
+    const key = `${question.uid || ''}|${question.image || ''}`;
+    if (!question.image) {
+      setStatus('A-Level Photo: waiting for image');
       return;
     }
-
-    const attemptKey = pair.uid + '|' + jigsawEndingKey(pair.ending);
-    if (
-      state.jigsawLastPrompt === attemptKey &&
-      Date.now() - state.jigsawLastClickAt < 280
-    ) {
-      setStatus('Jigsaw: waiting');
+    if (state.examPhotoSubmittedKey === key) {
+      setStatus('A-Level Photo: submitted — waiting for Continue');
+      await advanceExamAfterCompletion();
       return;
     }
-
-    const sections = verbSections(pair.entry);
-    const ending = jigsawFinalSection(pair.entry);
-
-    setPromptLabel(`${pair.entry.translatedVerb} → ${JSON.stringify(ending)}`);
-    addLog(
-      `Jigsaw ${state.jigsawDone.size + 1}/${valid.length}: ` +
-      `blue "${pair.entry.translatedVerb}" → white ending ${JSON.stringify(ending)} ` +
-      `[uid ${pair.uid}]`,
-      'ok'
-    );
-
-    state.jigsawLastPrompt = attemptKey;
-    state.jigsawLastClickAt = Date.now();
-
-    const beforeIncorrect = countJigsawTexture(/incorrectPiecePicture/i);
-    const beforeCorrect = countJigsawTexture(/jigsawCorrectPiece/i);
-
-    // Snapshot whether the selected blue piece and white ending are still present.
-    const beforePieceCount = pieces.filter(p => verbKey(p.label) === verbKey(pair.entry.translatedVerb)).length;
-    const beforeEndingCount = endings.filter(t => t.key === jigsawVerbKey(ending)).length;
-
-    // 1) Exact blue piece from API translatedVerb (+ prefix section check).
-    const pieceClicked = await clickJigsawPiece(pair.piece);
-    if (!pieceClicked) {
-      state.jigsawFails++;
-      addLog(`✗ Blue click failed: "${pair.entry.translatedVerb}"`, 'err');
-      setStatus('Jigsaw: blue click failed');
-      await sleep(70);
+    const input = examInput();
+    const submit = examSubmitControl();
+    const domSubmit = submit ? null : examSubmitDomControl();
+    if (!input || (!submit && !domSubmit)) {
+      setStatus('A-Level Photo: waiting for answer controls');
       return;
     }
-
-    await sleep(CONFIG.jigsawBetweenClicksMs);
-
-    // 2) Exact white final section from API <section>.
-    addLog(
-      `White ending candidate ${jigsawEndingKey(pair.ending)}; ` +
-      `API sections=[${sections.map(x => JSON.stringify(x)).join(', ')}]`,
-      'ok'
-    );
-
-    const targetClicked = await clickJigsawTarget(pair.ending);
-    if (!targetClicked) {
-      state.jigsawFails++;
-      addLog(`✗ White ending click failed: ${JSON.stringify(ending)}`, 'err');
-      setStatus('Jigsaw: ending click failed');
-      await sleep(70);
+    const answer = input.value.trim() || photoExamAnswer(question);
+    if (!input.value.trim()) {
+      const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
+      if (setter) setter.call(input, answer);
+      else input.value = answer;
+      input.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'insertText', data: answer}));
+      input.dispatchEvent(new Event('change', {bubbles: true}));
+      input.dispatchEvent(new KeyboardEvent('keyup', {bubbles: true, key: 'a'}));
+    }
+    if (!input.value.trim()) {
+      setStatus('A-Level Photo: answer input failed');
       return;
     }
-
-    await sleep(CONFIG.jigsawAfterPairMs);
-
-    const afterIncorrect = countJigsawTexture(/incorrectPiecePicture/i);
-    const afterCorrect = countJigsawTexture(/jigsawCorrectPiece/i);
-    const afterPieces = collectJigsawPieces(false);
-    const afterEndings = collectJigsawTargets();
-
-    const stillBlue = afterPieces.some(p => verbKey(p.label) === verbKey(pair.entry.translatedVerb));
-    const targetKey = jigsawEndingKey(pair.ending);
-    const endingStillThere = afterEndings.some(t => jigsawEndingKey(t) === targetKey);
-
-    if (afterIncorrect > beforeIncorrect) {
-      rejectedEndingSet(pair.uid).add(targetKey);
-      state.jigsawEndingAttempts.delete(attemptKey);
-      state.jigsawFails++;
-      addLog(
-        `✗ Rejected ending ${JSON.stringify(ending)} at ${targetKey}; ` +
-        `trying another identical ending next`,
-        'err'
-      );
-      setStatus('Jigsaw: wrong duplicate ending');
-      await sleep(100);
+    setPromptLabel(`Photo ${question.uid || ''}`);
+    let clicked = false;
+    if (submit) {
+      const b = submit.bounds;
+      clicked = await safeCanvasPointerClickWorld(b.x + b.width / 2, b.y + b.height / 2, '#4ade80', 150);
+    } else if (domSubmit) {
+      domSubmit.click();
+      clicked = true;
+    }
+    if (!clicked) {
+      setStatus('A-Level Photo: submit click failed');
       return;
     }
-
-    // Only call it correct when the game visibly consumed/moved something or
-    // displayed its correct sprite. This prevents the old 8/8 false-positive.
-    const accepted =
-      afterCorrect > beforeCorrect ||
-      !stillBlue ||
-      !endingStillThere ||
-      afterPieces.length < pieces.length ||
-      afterEndings.length < endings.length;
-
-    if (!accepted) {
-      const tries = (state.jigsawEndingAttempts.get(attemptKey) || 0) + 1;
-      state.jigsawEndingAttempts.set(attemptKey, tries);
-      state.jigsawFails++;
-
-      if (tries >= 2) {
-        rejectedEndingSet(pair.uid).add(targetKey);
-        state.jigsawEndingAttempts.delete(attemptKey);
-        addLog(
-          `? No placement after 2 tries on ${targetKey}; trying next matching ending`,
-          'err'
-        );
-      } else {
-        addLog(`? No visible placement; retrying same ending once`, 'err');
-      }
-
-      setStatus('Jigsaw: placement not confirmed');
-      await sleep(90);
-      return;
-    }
-
-    // Confirmed placement: reserve this exact white ending position.
-    const cx = pair.ending.bounds.x + pair.ending.bounds.width / 2;
-    const cy = pair.ending.bounds.y + pair.ending.bounds.height / 2;
-    if (!state.jigsawUsedTargetPositions.some(p => Math.abs(p.x - cx) < 24 && Math.abs(p.y - cy) < 24)) {
-      state.jigsawUsedTargetPositions.push({ x: cx, y: cy });
-    }
-
-    state.jigsawEndingAttempts.delete(attemptKey);
-    state.jigsawDone.add(pair.uid);
-    state.jigsawFails = 0;
-
-    addLog(
-      `✓ Jigsaw ${state.jigsawDone.size}/${valid.length}: ` +
-      `"${pair.entry.translatedVerb}" + ${JSON.stringify(ending)} ` +
-      `(blue ${beforePieceCount}→${afterPieces.filter(p => verbKey(p.label) === verbKey(pair.entry.translatedVerb)).length}, ` +
-      `ending ${beforeEndingCount}→${afterEndings.filter(t => t.key === jigsawVerbKey(ending)).length})`,
-      'ok'
-    );
-
-    setProgress(state.jigsawDone.size, valid.length);
-    setStatus('Jigsaw: matched');
-    await sleep(50);
+    state.examPhotoSubmittedKey = key;
+    state.answeredCount++;
+    setAnsweredCount(state.answeredCount);
+    addLog(`A-Level Photo submitted ${question.image}${question.image === 'a6239.jpg' ? '' : ' (general description)'}`, 'ok');
+    setStatus('A-Level Photo: submitted');
   }
 
   // ============ OPEN READING EXAM ============
@@ -10285,18 +11276,156 @@
       if (!shown) return;
       const b = boundsOf(o);
       if (!b || b.width < 10 || b.height < 10) return;
-      match = state.examTranslations.find(entry =>
-        normaliseText(entry.question) === shown
-      ) || null;
+      const cleanShown = shown.replace(/^\d+[\.\)]\s*/, '');
+      match = state.examTranslations.find(entry => {
+        const q = normaliseText(entry.question);
+        const cleanQ = q.replace(/^\d+[\.\)]\s*/, '');
+        return q === shown || cleanQ === cleanShown || (cleanQ.length > 5 && cleanShown.includes(cleanQ));
+      }) || null;
     });
+
+    if (!match) {
+      const options = examMultipleChoiceOptions();
+      if (options.length > 0) {
+        const optNorms = options.map(o => normaliseText(o.label));
+        match = state.examTranslations.find(entry =>
+          !state.examSubmitted.has(entry.uid) && optNorms.includes(normaliseText(entry.answer))
+        ) || null;
+      }
+    }
+
     return match;
   }
 
   function examInput() {
-    const input = document.getElementById('textInputChina');
+    let input = document.getElementById('textInputChina');
+    if (!input) input = document.querySelector('textarea:not(#ln-ac-panel textarea)');
     if (!(input instanceof HTMLTextAreaElement) && !(input instanceof HTMLInputElement)) return null;
     const b = input.getBoundingClientRect();
     return b.width > 0 && b.height > 0 ? input : null;
+  }
+
+  function examStartControl() {
+    const a = state.pixiApp;
+    if (!a) return null;
+    let found = null;
+    walk(a.stage, o => {
+      if (found || !isVisible(o, a.stage)) return;
+      const t = typeof o.text === 'string' ? o.text.trim() : '';
+      if (!/^start(?:\s+(?:now|game|exam|test))?!?$/i.test(t)) return;
+      let target = o;
+      if (o.parent && isVisible(o.parent, a.stage)) {
+        const pb = boundsOf(o.parent);
+        if (pb && pb.width > 25 && pb.height > 15) {
+          target = o.parent;
+        } else if (
+          o.parent.interactive ||
+          o.parent.eventMode === 'static' ||
+          o.parent.eventMode === 'dynamic' ||
+          o.parent.buttonMode
+        ) {
+          target = o.parent;
+        }
+      }
+      let bounds = boundsOf(target) || boundsOf(o);
+      if (!bounds || bounds.width <= 0 || bounds.height <= 0) {
+        let gx = 0, gy = 0;
+        try {
+          if (typeof target.toGlobal === 'function') {
+            const p = target.toGlobal({ x: 0, y: 0 });
+            gx = p.x; gy = p.y;
+          } else if (typeof o.toGlobal === 'function') {
+            const p = o.toGlobal({ x: 0, y: 0 });
+            gx = p.x; gy = p.y;
+          }
+        } catch (_) {}
+        if (!gx && bounds) gx = bounds.x;
+        if (!gy && bounds) gy = bounds.y;
+        bounds = {
+          x: gx,
+          y: gy,
+          width: Math.max(bounds && bounds.width ? bounds.width : 0, o.width || 130),
+          height: Math.max(bounds && bounds.height ? bounds.height : 0, o.height || 45)
+        };
+      }
+      found = { obj: target, labelObj: o, bounds };
+    });
+    return found;
+  }
+
+  function examStartDomControl() {
+    try {
+      const nodes = document.querySelectorAll(
+        'button, input[type="button"], input[type="submit"], [role="button"], a.btn, div.btn, .btn, .button'
+      );
+      return Array.from(nodes).find(node => {
+        if (!node || node.closest('#ln-ac-panel')) return false;
+        const text = String(
+          node.innerText || node.value || node.getAttribute('aria-label') || ''
+        ).trim();
+        const r = node.getBoundingClientRect();
+        return /^start(?:\s+(?:now|game|exam|test))?!?$/i.test(text) && r.width > 20 && r.height > 15;
+      }) || null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  async function dismissStartDialog() {
+    if (Date.now() - (state.lastStartDismissAt || 0) < 400) return true;
+
+    const start = examStartControl();
+    const domStart = start ? null : examStartDomControl();
+    if (!start && !domStart) return false;
+
+    state.lastStartDismissAt = Date.now();
+    setStatus('Dismissing start dialog…');
+    let clicked = false;
+
+    if (start) {
+      emitOnObject(start.obj, 'pointerdown');
+      emitOnObject(start.obj, 'mousedown');
+      emitOnObject(start.obj, 'pointerup');
+      emitOnObject(start.obj, 'mouseup');
+      emitOnObject(start.obj, 'click');
+      emitOnObject(start.obj, 'tap');
+      emitOnObject(start.obj, 'keyup');
+      if (start.labelObj && start.labelObj !== start.obj) {
+        emitOnObject(start.labelObj, 'pointerdown');
+        emitOnObject(start.labelObj, 'pointerup');
+        emitOnObject(start.labelObj, 'click');
+        emitOnObject(start.labelObj, 'tap');
+      }
+
+      await clickTile(start.obj);
+
+      const b = start.bounds;
+      if (b && b.width > 0 && b.height > 0) {
+        clicked = await safeCanvasPointerClickWorld(
+          b.x + b.width / 2, b.y + b.height / 2, '#4ade80', 200
+        );
+      } else {
+        clicked = true;
+      }
+    }
+
+    if (domStart) {
+      try {
+        domStart.dispatchEvent(new MouseEvent('mouseover', { bubbles: true, cancelable: true, view: window }));
+        domStart.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+        domStart.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+        domStart.click();
+        await sleep(200);
+        clicked = true;
+      } catch (_) {}
+    }
+
+    if (clicked) {
+      addLog('Start dialog dismissed', 'ok');
+      await sleep(250);
+      return true;
+    }
+    return false;
   }
 
   function examSubmitControl() {
@@ -10304,14 +11433,20 @@
     if (!a) return null;
     let found = null;
     walk(a.stage, o => {
-      if (found || o.text !== 'Submit' || !isVisible(o, a.stage)) return;
-      // The open-reading page uses correctButtonBackground for Submit. Its
-      // pointerup handler is on the label's parent, not on the sprite.
-      const target = o.parent;
-      if (!target || !isVisible(target, a.stage)) return;
-      if (!verbEventNames(target).some(name => /^(?:pointerup|click|tap)$/i.test(name))) return;
-      const bounds = boundsOf(target);
-      if (bounds && bounds.width > 30 && bounds.height > 20) found = {obj: target, bounds};
+      if (found || !isVisible(o, a.stage)) return;
+      const t = typeof o.text === 'string' ? o.text.trim() : '';
+      if (!/^submit!?$/i.test(t)) return;
+      let target = o;
+      if (o.parent && isVisible(o.parent, a.stage)) {
+        const pb = boundsOf(o.parent);
+        if (pb && pb.width > 25 && pb.height > 15) {
+          target = o.parent;
+        }
+      }
+      const bounds = boundsOf(target) || boundsOf(o);
+      if (bounds && bounds.width > 20 && bounds.height > 15) {
+        found = {obj: target, labelObj: o, bounds};
+      }
     });
     return found;
   }
@@ -10407,9 +11542,9 @@
       if (!isVisible(o, a.stage)) return;
       if (!verbEventNames(o).some(name => /^(?:pointerup|click|tap)$/i.test(name))) return;
       const bounds = boundsOf(o);
-      if (!bounds || bounds.x < 480 || bounds.y < 180 || bounds.y > 500 ||
-          bounds.width < 180 || bounds.width > 460 ||
-          bounds.height < 30 || bounds.height > 100) return;
+      if (!bounds || bounds.x < 250 || bounds.y < 100 || bounds.y > 600 ||
+          bounds.width < 100 || bounds.width > 550 ||
+          bounds.height < 20 || bounds.height > 150) return;
       let hasAnswerBackground = false;
       const labels = [];
       walk(o, child => {
@@ -10583,22 +11718,753 @@
     setStatus('Exam True / False: answered — waiting for next question');
   }
 
-  function examContinueControls() {
+  function continueControls() {
+    const out = [];
+    const a = state.pixiApp;
+    if (a && a.stage) {
+      const res = (a.renderer && a.renderer.resolution) || 1;
+      const maxX = (a.renderer.width || a.view.width) / res;
+      const maxY = (a.renderer.height || a.view.height) / res;
+      walk(a.stage, labelObj => {
+        // Pixi text can contain instructions such as "...continue your streak!"
+        // inside a clickable card. Only a button label or continue asset counts.
+        const label = [labelObj.text, labelObj.accessibleTitle]
+          .filter(value => typeof value === 'string')
+          .find(value => /^\s*continue\b/i.test(value)) ||
+          [labelObj.name, fullTextureName(labelObj), textureName(labelObj)]
+            .filter(value => typeof value === 'string')
+            .find(value => /(?:^|[\/_-])continue(?:button)?(?:[.\s_/-]|$)/i.test(value));
+        if (!label) return;
+        if (!isVisible(labelObj, a.stage)) return;
+        let obj = labelObj;
+        for (let depth = 0; obj && depth < 7; depth++, obj = obj.parent) {
+          if (!isVisible(obj, a.stage)) break;
+          const events = verbEventNames(obj);
+          const event = ['pointerup', 'pointertap', 'click', 'tap'].find(name => events.includes(name));
+          if (!event && obj.interactive !== true && obj.eventMode !== 'static' &&
+              obj.eventMode !== 'dynamic' && obj.buttonMode !== true) continue;
+          const bounds = boundsOf(obj);
+          if (!bounds || bounds.width < 30 || bounds.height < 18 ||
+              bounds.width > 600 || bounds.height > 180 ||
+              bounds.x < 0 || bounds.y < 0 ||
+              bounds.x >= maxX || bounds.y >= maxY) continue;
+          if (!out.some(item => item.obj === obj)) {
+            out.push({kind: 'pixi', obj, bounds, event, label: label.trim()});
+          }
+          break;
+        }
+      });
+    }
+    const selector = 'button, input[type="button"], input[type="submit"], [role="button"]';
+    document.querySelectorAll(selector).forEach(obj => {
+      if (obj.closest('#ln-ac-panel') || obj.disabled || obj.getAttribute('aria-disabled') === 'true') return;
+      const label = String(obj.innerText || obj.value || obj.getAttribute('aria-label') || '').trim();
+      if (!/\bcontinue\b/i.test(label)) return;
+      const bounds = obj.getBoundingClientRect();
+      if (bounds.width < 30 || bounds.height < 18 ||
+          bounds.bottom <= 0 || bounds.right <= 0 ||
+          bounds.top >= innerHeight || bounds.left >= innerWidth) return;
+      if (getComputedStyle(obj).visibility === 'hidden' || getComputedStyle(obj).display === 'none') return;
+      out.push({kind: 'dom', obj, bounds, label});
+    });
+    return out.sort((x, y) => {
+      const xe = /^continue!?$/i.test(x.label) ? 0 : 1;
+      const ye = /^continue!?$/i.test(y.label) ? 0 : 1;
+      return xe - ye || x.bounds.width * x.bounds.height - y.bounds.width * y.bounds.height;
+    });
+  }
+
+  function examContinueControls() { return continueControls(); }
+
+  async function clickVisibleContinue() {
+    const control = continueControls()[0];
+    if (!control) return false;
+    if (state.continueLastControl === control.obj && Date.now() - state.continueLastAt < 900) return true;
+    const completed = !!detectCompletion();
+    let clicked = false;
+    if (control.kind === 'dom') {
+      try { control.obj.click(); clicked = true; } catch (_) {}
+    } else {
+      clicked = control.event ? emitOnObject(control.obj, control.event) : false;
+      if (!clicked) {
+        const b = control.bounds;
+        clicked = await safeCanvasPointerClickWorld(
+          b.x + b.width / 2, b.y + b.height / 2, '#4ade80', 80
+        );
+      }
+    }
+    if (clicked) {
+      if (completed) {
+        logFakeTimeCompletion();
+        resetFakeTimeActivity();
+      }
+      state.continueLastControl = control.obj;
+      state.continueLastAt = Date.now();
+      addLog(`Continue clicked: ${control.label}`, 'ok');
+      setStatus('Continuing…');
+    }
+    return clicked;
+  }
+
+  async function examDictationTick() {
+    // 1. Dismiss start overlay if present
+    if (await dismissStartDialog()) return;
+
+    // 2. Check for answers
+    let entry = state.examDictationData;
+    if (!entry || !entry.text) {
+      if (state.examTranslations && state.examTranslations.length) {
+        const t = state.examTranslations[0];
+        entry = { text: t.answer || t.question, uid: t.uid };
+      }
+    }
+    if (!entry || !entry.text) {
+      setStatus('Exam Text/Dictation: waiting for answers');
+      return;
+    }
+    setPromptLabel(entry.text.length > 50 ? `${entry.text.slice(0, 50)}…` : entry.text);
+
+    if (state.examDictationSubmitted || (entry.uid && state.examSubmitted.has(entry.uid))) {
+      setStatus('Exam Text/Dictation: submitted — waiting for completion');
+      return;
+    }
+
+    // 3. Find input textarea
+    const input = examInput();
+    if (!input) {
+      setStatus('Exam Text/Dictation: waiting for input field');
+      return;
+    }
+
+    // 4. Fill input
+    input.focus();
+    const inputPrototype = input instanceof HTMLTextAreaElement
+      ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(inputPrototype, 'value')?.set;
+    if (setter) setter.call(input, entry.text);
+    else input.value = entry.text;
+    input.dispatchEvent(new InputEvent('input', {
+      bubbles: true, inputType: 'insertText', data: entry.text
+    }));
+    input.dispatchEvent(new Event('change', {bubbles: true}));
+    input.dispatchEvent(new KeyboardEvent('keyup', {bubbles: true, key: 'a'}));
+
+    if (!input.value || input.value.trim().length === 0) {
+      setStatus('Exam Text/Dictation: answer input failed');
+      return;
+    }
+
+    // Allow UI to register input/word count
+    await sleep(150);
+
+    // 5. Submit answer
+    const submit = examSubmitControl();
+    const domSubmit = submit ? null : examSubmitDomControl();
+    if (!submit && !domSubmit) {
+      setStatus('Exam Text/Dictation: waiting for submit button');
+      return;
+    }
+
+    let clicked = false;
+    if (submit) {
+      emitOnObject(submit.obj, 'pointerdown');
+      emitOnObject(submit.obj, 'pointerup');
+      emitOnObject(submit.obj, 'click');
+      emitOnObject(submit.obj, 'tap');
+      await clickTile(submit.obj);
+      const b = submit.bounds;
+      if (b && b.width > 0) {
+        clicked = await safeCanvasPointerClickWorld(
+          b.x + b.width / 2, b.y + b.height / 2, '#4ade80', 250
+        );
+      } else {
+        clicked = true;
+      }
+    }
+
+    if (domSubmit) {
+      try {
+        domSubmit.click();
+        await sleep(250);
+        clicked = true;
+      } catch (_) {}
+    }
+
+    if (!clicked) {
+      setStatus('Exam Text/Dictation: submit click failed');
+      return;
+    }
+
+    state.examDictationSubmitted = true;
+    if (entry.uid) state.examSubmitted.add(entry.uid);
+    state.answeredCount++;
+    setAnsweredCount(state.answeredCount);
+    addLog(`Exam Text/Dictation submitted (${entry.text.length} chars)`, 'ok');
+    setStatus('Exam Text/Dictation: submitted — waiting for completion');
+    await advanceExamAfterCompletion();
+  }
+
+
+  function findWhoSaidWhatColumns() {
+    const a = state.pixiApp;
+    if (!a) return new Map();
+    const cols = new Map();
+    const fallbackCandidates = [];
+
+    walk(a.stage, o => {
+      if (!isVisible(o, a.stage)) return;
+      const b = boundsOf(o);
+      if (!b) return;
+
+      let letter = null;
+      walk(o, child => {
+        if (letter) return;
+        const tex = `${fullTextureName(child)} ${textureName(child)}`;
+        const m = tex.match(/who\/([a-z])\.png/i);
+        if (m) letter = m[1].toUpperCase();
+      });
+
+      if (letter && b.width >= 120 && b.width <= 320 && b.height >= 200 && b.height <= 500 && b.x < 700) {
+        if (!cols.has(letter)) {
+          cols.set(letter, { obj: o, bounds: b, letter });
+        }
+      } else if (b.width >= 150 && b.width <= 300 && b.height >= 250 && b.height <= 500 && b.x < 700 && b.y >= 100 && b.y <= 300) {
+        fallbackCandidates.push({ obj: o, bounds: b });
+      }
+    });
+
+    if (cols.size === 0 && fallbackCandidates.length >= 2) {
+      fallbackCandidates.sort((c1, c2) => c1.bounds.x - c2.bounds.x);
+      const uniqueCols = [];
+      for (const fc of fallbackCandidates) {
+        if (!uniqueCols.some(u => Math.abs(u.bounds.x - fc.bounds.x) < 30)) {
+          uniqueCols.push(fc);
+        }
+      }
+      const alphabet = ['A', 'B', 'C', 'D', 'E'];
+      uniqueCols.slice(0, 5).forEach((col, idx) => {
+        cols.set(alphabet[idx], { ...col, letter: alphabet[idx] });
+      });
+    }
+
+    return cols;
+  }
+
+  function collectWhoSaidWhatStatements() {
     const a = state.pixiApp;
     if (!a) return [];
-    const out = [];
-    walk(a.stage, obj => {
-      if (!isVisible(obj, a.stage)) return;
-      if (!verbEventNames(obj).some(name => /^(?:pointerup|click|tap)$/i.test(name))) return;
-      const labels = [];
-      walk(obj, child => {
-        if (typeof child.text === 'string' && child.text.trim()) labels.push(child.text.trim());
+    const statements = [];
+    walk(a.stage, o => {
+      if (!isVisible(o, a.stage)) return;
+      const b = boundsOf(o);
+      if (!b) return;
+      if (b.x < 600 || b.y < 180 || b.y > 600 || b.width < 120 || b.height < 15 || b.height > 80) return;
+
+      let text = '';
+      walk(o, child => {
+        if (!text && typeof child.text === 'string' && child.text.trim()) {
+          text = child.text.trim();
+        }
       });
-      if (!labels.some(text => /^continue!?$/i.test(text))) return;
-      const bounds = boundsOf(obj);
-      if (bounds && bounds.width > 40 && bounds.height > 20) out.push({obj, bounds});
+      if (text && text.length > 2 && !/^(?:submit|printables|reset|start)$/i.test(text)) {
+        statements.push({ obj: o, text, bounds: b, norm: normaliseText(text) });
+      }
     });
-    return out.sort((a, b) => a.bounds.y - b.bounds.y || a.bounds.x - b.bounds.x);
+
+    const unique = new Map();
+    for (const s of statements) {
+      if (!unique.has(s.norm)) {
+        unique.set(s.norm, s);
+      }
+    }
+    return Array.from(unique.values()).sort((s1, s2) => s1.bounds.y - s2.bounds.y);
+  }
+
+  async function whoSaidWhatTick() {
+    if (await dismissStartDialog()) return;
+
+    if (!state.whoSaidWhatStatements || !state.whoSaidWhatStatements.length) {
+      setStatus('Who Said What: waiting for answers data');
+      return;
+    }
+
+    if (state.whoSaidWhatSubmitted) {
+      setStatus('Who Said What: submitted — waiting for completion');
+      return;
+    }
+
+    const cols = findWhoSaidWhatColumns();
+    if (cols.size === 0) {
+      setStatus('Who Said What: locating columns...');
+      return;
+    }
+
+    const unplaced = collectWhoSaidWhatStatements();
+    if (unplaced.length === 0) {
+      const submit = examSubmitControl();
+      const domSubmit = submit ? null : examSubmitDomControl();
+      if (!submit && !domSubmit) {
+        setStatus('Who Said What: waiting for Submit button');
+        return;
+      }
+
+      setStatus('Who Said What: submitting...');
+      let clicked = false;
+      if (submit) {
+        emitOnObject(submit.obj, 'pointerdown');
+        emitOnObject(submit.obj, 'pointerup');
+        const b = submit.bounds;
+        if (b && b.width > 0) {
+          clicked = await safeCanvasPointerClickWorld(b.x + b.width / 2, b.y + b.height / 2, '#4ade80', 250);
+        } else {
+          clicked = true;
+        }
+      } else if (domSubmit) {
+        try {
+          domSubmit.click();
+          await sleep(250);
+          clicked = true;
+        } catch (_) {}
+      }
+
+      if (clicked) {
+        state.whoSaidWhatSubmitted = true;
+        state.answeredCount++;
+        setAnsweredCount(state.answeredCount);
+        addLog(`Who Said What: submitted all statements`, 'ok');
+        setStatus('Who Said What: submitted — waiting for completion');
+        await sleep(1000);
+      } else {
+        setStatus('Who Said What: submit click failed');
+      }
+      return;
+    }
+
+    const stmt = unplaced[0];
+    const match = state.whoSaidWhatStatements.find(e =>
+      e.normalisedStatement === stmt.norm ||
+      e.normalisedStatement.includes(stmt.norm) ||
+      stmt.norm.includes(e.normalisedStatement)
+    ) || state.whoSaidWhatStatements.find(e => {
+      const wordsA = stmt.norm.split(' ').filter(Boolean);
+      const wordsB = e.normalisedStatement.split(' ').filter(Boolean);
+      const common = wordsA.filter(w => wordsB.includes(w));
+      return common.length >= Math.min(wordsA.length, wordsB.length) * 0.7;
+    });
+
+    if (!match) {
+      addLog(`Who Said What: unrecognised statement "${stmt.text}"`, 'err');
+      setStatus(`Who Said What: no match for "${stmt.text.slice(0, 15)}..."`);
+      await sleep(1000);
+      return;
+    }
+
+    const targetPerson = match.person;
+    const targetCol = cols.get(targetPerson);
+    if (!targetCol) {
+      addLog(`Who Said What: column ${targetPerson} not found`, 'err');
+      setStatus(`Who Said What: missing column ${targetPerson}`);
+      await sleep(1000);
+      return;
+    }
+
+    setPromptLabel(`${stmt.text} → Person ${targetPerson}`);
+    setStatus(`Who Said What: moving to ${targetPerson} (${unplaced.length} left)`);
+
+    const targetBounds = {
+      x: targetCol.bounds.x,
+      y: targetCol.bounds.y + targetCol.bounds.height * 0.3,
+      width: targetCol.bounds.width,
+      height: targetCol.bounds.height * 0.4
+    };
+
+    await dragTileTo(stmt.obj, targetBounds);
+    await sleep(250);
+
+    const postBounds = boundsOf(stmt.obj);
+    if (postBounds && postBounds.x >= 600) {
+      await clickTile(stmt.obj);
+      await sleep(120);
+      await safeCanvasPointerClickWorld(
+        targetBounds.x + targetBounds.width / 2,
+        targetBounds.y + targetBounds.height / 2,
+        '#ffb45c',
+        150
+      );
+      await sleep(250);
+    }
+  }
+
+  const INTERPRET_LANGUAGES = {
+    english: 'en', en: 'en',
+    german: 'de', deutsch: 'de', de: 'de',
+    french: 'fr', francais: 'fr', français: 'fr', fr: 'fr',
+    spanish: 'es', espanol: 'es', español: 'es', es: 'es',
+    italian: 'it', italiano: 'it', it: 'it',
+    welsh: 'cy', cymraeg: 'cy', cy: 'cy',
+    gaelic: 'gd', irish: 'ga', gaeilge: 'ga',
+    japanese: 'ja', chinese: 'zh', mandarin: 'zh',
+    russian: 'ru', arabic: 'ar', portuguese: 'pt', pt: 'pt',
+    dutch: 'nl', nl: 'nl', polish: 'pl', pl: 'pl',
+    swedish: 'sv', norwegian: 'no', danish: 'da',
+    greek: 'el', latin: 'la', hindi: 'hi', korean: 'ko', turkish: 'tr'
+  };
+
+  function parseInterpretPrompt(rawText) {
+    const text = String(rawText || '').trim();
+    // Exclude "Translate [the following|the text] (to|into) {language}[:|-]?"
+    const regex = /^\s*Translat(?:e|ion)\s+(?:the\s+(?:following|sentences?|text)\s+)?(?:in)?to\s+([A-Za-z\u00C0-\u00FF]+)\s*[:\-\n\r]*\s*/i;
+    const match = text.match(regex);
+    let targetLangName = 'en';
+    let cleanText = text;
+    if (match) {
+      targetLangName = match[1].toLowerCase();
+      cleanText = text.slice(match[0].length).trim();
+    } else {
+      // Check if breadcrumb or title mentions "Translation to {language}"
+      const a = state.pixiApp;
+      if (a) {
+        walk(a.stage, o => {
+          if (typeof o.text === 'string') {
+            const m = o.text.match(/Translat(?:e|ion)\s+(?:in)?to\s+([A-Za-z\u00C0-\u00FF]+)/i);
+            if (m) targetLangName = m[1].toLowerCase();
+          }
+        });
+      }
+    }
+    const targetCode = INTERPRET_LANGUAGES[targetLangName] || 'en';
+    return {
+      targetLang: targetCode,
+      targetLangName,
+      sourceText: cleanText
+    };
+  }
+
+  async function translateWithLibre(text, targetLang) {
+    if (state.mode !== 'exam-interpret' && !isInterpretRoute()) {
+      return null;
+    }
+
+    const primaryUrl = CONFIG.libreTranslateUrl || 'https://libretranslate.com/translate';
+    const apiKey = CONFIG.libreTranslateApiKey || '';
+
+    // Primary: requested https://libretranslate.com/translate endpoint
+    try {
+      const payload = {
+        q: text,
+        source: 'auto',
+        target: targetLang || 'en',
+        format: 'text'
+      };
+      if (apiKey) payload.api_key = apiKey;
+
+      const res = await fetch(primaryUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json'
+        },
+        body: JSON.stringify(payload)
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        if (data && data.translatedText) {
+          return data.translatedText;
+        }
+      }
+      log(`LibreTranslate primary returned ${res.status}: ${await res.text().catch(() => '')}`);
+    } catch (e) {
+      log('LibreTranslate primary fetch error:', e);
+    }
+
+    // Fallback 1: Public LibreTranslate instance (Argos OpenTech)
+    try {
+      const res = await fetch('https://translate.argosopentech.com/translate', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json'
+        },
+        body: JSON.stringify({
+          q: text,
+          source: 'auto',
+          target: targetLang || 'en',
+          format: 'text'
+        })
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data && data.translatedText) {
+          return data.translatedText;
+        }
+      }
+    } catch (e) {
+      log('LibreTranslate fallback fetch error:', e);
+    }
+
+    // Fallback 2: Google Translate GTX free endpoint
+    try {
+      const q = encodeURIComponent(text);
+      const tl = encodeURIComponent(targetLang || 'en');
+      const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=${tl}&dt=t&q=${q}`;
+      const res = await fetch(url);
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data) && Array.isArray(data[0])) {
+          const translated = data[0].map(item => item[0]).join('');
+          if (translated) return translated;
+        }
+      }
+    } catch (e) {
+      log('Google Translate fallback fetch error:', e);
+    }
+
+    // Fallback 3: MyMemory free translation API
+    try {
+      const q = encodeURIComponent(text.slice(0, 500));
+      const tl = encodeURIComponent(targetLang || 'en');
+      const res = await fetch(`https://api.mymemory.translated.net/get?q=${q}&langpair=autodetect|${tl}`);
+      if (res.ok) {
+        const data = await res.json();
+        if (data && data.responseData && data.responseData.translatedText) {
+          return data.responseData.translatedText;
+        }
+      }
+    } catch (e) {
+      log('MyMemory fallback fetch error:', e);
+    }
+
+    return null;
+  }
+
+  function findInterpretPromptText() {
+    const a = state.pixiApp;
+    if (!a) return null;
+
+    let candidate = '';
+    walk(a.stage, o => {
+      if (candidate || !isVisible(o, a.stage)) return;
+      const t = typeof o.text === 'string' ? o.text.trim() : '';
+      if (/translate\s+(?:the\s+(?:following|sentences?|text)\s+)?(?:in)?to\s+/i.test(t)) {
+        // o.name often preserves \r\n line breaks in Text objects
+        const raw = (typeof o.name === 'string' && o.name.length >= t.length && /translate/i.test(o.name))
+          ? o.name
+          : t;
+        candidate = raw;
+      }
+    });
+
+    if (candidate) return candidate;
+
+    // Fallback: search for prompt text block on left side of screen
+    walk(a.stage, o => {
+      if (candidate || !isVisible(o, a.stage)) return;
+      const t = typeof o.text === 'string' ? o.text.trim() : '';
+      const b = boundsOf(o);
+      if (t.length > 20 && b && b.x < 480 && b.y >= 80 && b.y < 500 && !/^(?:submit|start|teacher|marked|points|ranking)/i.test(t)) {
+        candidate = typeof o.name === 'string' && o.name.length >= t.length ? o.name : t;
+      }
+    });
+
+    if (candidate) return candidate;
+
+    if (state.examOriginalText) return state.examOriginalText;
+    if (state.examTranslations && state.examTranslations.length && state.examTranslations[0].question) {
+      return state.examTranslations[0].question;
+    }
+    return null;
+  }
+
+  async function examInterpretTick() {
+    if (state.mode !== 'exam-interpret' && !isInterpretRoute()) return;
+
+    // 1. Dismiss Start dialog if open
+    if (await dismissStartDialog()) return;
+
+    // 2. Locate question text
+    const rawPrompt = findInterpretPromptText();
+    if (!rawPrompt) {
+      setStatus('Exam Interpret: waiting for question text');
+      return;
+    }
+
+    // 3. Parse target language and exclude "Translate into {language}"
+    const parsed = parseInterpretPrompt(rawPrompt);
+    if (!parsed.sourceText) {
+      setStatus('Exam Interpret: empty source text');
+      return;
+    }
+
+    const promptSig = normaliseText(parsed.sourceText);
+    if (state.lastInterpretPrompt !== promptSig) {
+      state.lastInterpretPrompt = promptSig;
+      state.examInterpretSubmitted = false;
+    }
+
+    if (state.examInterpretSubmitted || state.examSubmitted.has(promptSig)) {
+      setStatus('Exam Interpret: submitted — waiting for completion');
+      await advanceExamAfterCompletion();
+      return;
+    }
+
+    setPromptLabel(`[${parsed.targetLang.toUpperCase()}] ${parsed.sourceText.slice(0, 35)}...`);
+
+    // 4. Locate textarea
+    const input = examInput();
+    if (!input) {
+      setStatus('Exam Interpret: waiting for textarea');
+      return;
+    }
+
+    // 5. Get translated text (cached or via LibreTranslate API)
+    let translatedText = state.interpretCache.get(promptSig);
+    if (!translatedText) {
+      if (state.interpretTranslating) {
+        return; // Translation already in progress, avoid duplicate concurrent API calls
+      }
+      state.interpretTranslating = true;
+      setStatus(`Exam Interpret: translating to ${parsed.targetLang}...`);
+      try {
+        translatedText = await translateWithLibre(parsed.sourceText, parsed.targetLang);
+      } finally {
+        state.interpretTranslating = false;
+      }
+
+      if (!translatedText) {
+        addLog('Exam Interpret: translation failed', 'err');
+        setStatus('Exam Interpret: translation API failed');
+        await sleep(1500);
+        return;
+      }
+      state.interpretCache.set(promptSig, translatedText);
+    }
+
+    // Log Translated exactly once per question
+    if (!state.interpretLogged.has(promptSig)) {
+      state.interpretLogged.add(promptSig);
+      addLog(`Translated: "${translatedText.slice(0, 50)}..."`, 'ok');
+    }
+
+    // 6. Paste into <textarea id="textInputChina">
+    input.focus();
+    const inputPrototype = input instanceof HTMLTextAreaElement
+      ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(inputPrototype, 'value')?.set;
+    if (setter) {
+      setter.call(input, translatedText);
+    } else {
+      input.value = translatedText;
+    }
+
+    const keyOpts = {
+      key: 'a',
+      code: 'KeyA',
+      keyCode: 65,
+      which: 65,
+      charCode: 65,
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      view: window
+    };
+    input.dispatchEvent(new KeyboardEvent('keydown', keyOpts));
+    input.dispatchEvent(new KeyboardEvent('keypress', keyOpts));
+    input.dispatchEvent(new InputEvent('input', {
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      inputType: 'insertText',
+      data: translatedText
+    }));
+    input.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+    input.dispatchEvent(new KeyboardEvent('keyup', keyOpts));
+    document.dispatchEvent(new KeyboardEvent('keyup', keyOpts));
+    window.dispatchEvent(new KeyboardEvent('keyup', keyOpts));
+
+    if (!input.value || input.value.trim().length === 0) {
+      input.value = translatedText;
+    }
+
+    await sleep(200);
+
+    // 7. Submit answer
+    const submit = examSubmitControl();
+    const domSubmit = submit ? null : examSubmitDomControl();
+    if (!submit && !domSubmit) {
+      setStatus('Exam Interpret: waiting for submit button');
+      return;
+    }
+
+    let clicked = false;
+    if (submit) {
+      if (submit.obj) {
+        submit.obj.alpha = 1;
+        submit.obj.interactive = true;
+        submit.obj.buttonMode = true;
+        if (Array.isArray(submit.obj.children)) {
+          submit.obj.children.forEach(c => {
+            if (c) {
+              c.alpha = 1;
+              c.interactive = true;
+            }
+          });
+        }
+      }
+
+      emitOnObject(submit.obj, 'pointerover');
+      emitOnObject(submit.obj, 'pointerdown');
+      emitOnObject(submit.obj, 'pointerup');
+      emitOnObject(submit.obj, 'click');
+      emitOnObject(submit.obj, 'tap');
+      emitOnObject(submit.obj, 'keyup');
+      if (submit.labelObj) {
+        emitOnObject(submit.labelObj, 'pointerdown');
+        emitOnObject(submit.labelObj, 'pointerup');
+        emitOnObject(submit.labelObj, 'click');
+        emitOnObject(submit.labelObj, 'tap');
+      }
+
+      await clickTile(submit.obj);
+
+      const b = submit.bounds;
+      if (b && b.width > 0) {
+        clicked = await safeCanvasPointerClickWorld(
+          b.x + b.width / 2, b.y + b.height / 2, '#4ade80', 250
+        );
+      } else {
+        clicked = true;
+      }
+    }
+
+    if (domSubmit) {
+      try {
+        domSubmit.click();
+        await sleep(250);
+        clicked = true;
+      } catch (_) {}
+    }
+
+    // Also dispatch Enter key on input as fallback
+    const enterOpts = {
+      key: 'Enter',
+      code: 'Enter',
+      keyCode: 13,
+      which: 13,
+      bubbles: true,
+      cancelable: true,
+      view: window
+    };
+    input.dispatchEvent(new KeyboardEvent('keydown', enterOpts));
+    input.dispatchEvent(new KeyboardEvent('keyup', enterOpts));
+
+    state.examInterpretSubmitted = true;
+    state.examSubmitted.add(promptSig);
+    state.answeredCount++;
+    setAnsweredCount(state.answeredCount);
+    addLog(`Exam Interpret submitted (${translatedText.length} chars)`, 'ok');
+    setStatus('Exam Interpret: submitted — waiting for completion');
+    await advanceExamAfterCompletion();
   }
 
   async function advanceExamAfterCompletion() {
@@ -10612,22 +12478,18 @@
     }
     state.examContinueBusy = true;
     state.examContinueAt = now;
-    const control = controls[0];
     try {
-      let clicked = emitOnObject(control.obj, 'pointerup');
-      if (clicked) await sleep(350);
-      if (!clicked) {
-        const b = control.bounds;
-        clicked = await safeCanvasPointerClickWorld(
-          b.x + b.width / 2, b.y + b.height / 2, '#4ade80', 250
-        );
-      }
+      const clicked = await clickVisibleContinue();
       if (clicked) {
         addLog(`Exam Continue clicked${controls.length > 1 ? ' — confirmation may follow' : ''}`, 'ok');
         state.examSubmitted = new Set();
         state.examGapOrder = [];
         state.examGapIndex = 0;
         state.examGapSubmitted = false;
+        state.examDictationSubmitted = false;
+        state.whoSaidWhatSubmitted = false;
+        state.examInterpretSubmitted = false;
+        state.lastInterpretPrompt = null;
         state.completionSeen = null;
       }
     } finally {
@@ -10663,7 +12525,18 @@
       }
     }
     if (m !== state.mode) {
-      state.fakeTimeAnswerBase = state.answeredCount;
+      if (state.mode === 'race-driver') raceDriverBoost(false);
+      logFakeTimeCompletion();
+      resetFakeTimeActivity();
+      state.zenMemoryLastCount = 0;
+      state.zenNoughtsLastCount = 0;
+      state.zenNoughtsNextMoveAt = 0;
+      state.raceLastQuestion = '';
+      state.raceLastChunks = 0;
+      state.dictationSubmitted = false;
+      state.dictationSawHidden = false;
+      state.dictationPlayAt = 0;
+      state.dictationLastAudio = '';
       state.mode = m;
       setModeLabel(modeLabel(m));
       if (m) {
@@ -10680,6 +12553,18 @@
         );
         if (m === 'skyrise') addLog(
           `Skyrise mode: DOM input`
+        );
+        if (m === 'dictation') addLog(
+          'Dictation: match the playing audio to the sentence, then submit the text'
+        );
+        if (m === 'exam-dictation') addLog(
+          'Exam Dictation: exact audio transcript and submit controls'
+        );
+        if (m === 'exam-who-said-what') addLog(
+          'Who Said What: speaker column classification and auto-submit'
+        );
+        if (m === 'exam-interpret') addLog(
+          'Exam Interpret: LibreTranslate API translation and textInputChina submission'
         );
         if (m === 'exam-open-reading' || m === 'exam-open-listening' || m === 'exam-synonym') addLog(
           `${modeLabel(m)}: exact API answer and submit controls`
@@ -10714,8 +12599,17 @@
       }
       updateModeButtons(m);
     }
+
+    // Dismiss any start dialog immediately whenever visible across all games & exams
+    if (await dismissStartDialog()) return;
+
+    // A visible Continue control takes priority over the completion screen and
+    // over a stale question still visible behind a result overlay.
+    if (await clickVisibleContinue()) return;
+
     const done = detectCompletion();
     if (done) {
+      logFakeTimeCompletion();
       if (/^exam-/.test(String(m || ''))) {
         await advanceExamAfterCompletion();
         return;
@@ -10728,53 +12622,33 @@
         state.concertHadQuestion
       ) {
         if (!concertCanUnlockForCompletion(done)) {
-          addLog(
-            `Concert ignored generic completion signal while question is active: "${done}"`,
-            'err'
+          if (state.completionSeen !== done) addLog(
+            `Concert ignored generic completion signal while question is active: "${done}"`, 'err'
           );
-
           state.completionSeen = null;
         } else {
-          state.completionSeen = done;
-          state.concertCompleted = true;
-          concertReleaseNavigationLock('confirmed Concert completion');
-          concertRestoreForbiddenNavGuards();
-
-          addLog(`✓ Complete: "${done}"`, 'ok');
-          setStatus('Complete');
-          notifyDiscord(
-            'Activity completed',
-            `Answered counter: ${state.answeredCount}`
-          );
-          state.running = false;
-
-          const b = document.getElementById('ln-ac-toggle');
-          if (b) {
-            b.textContent = 'Start';
-            b.classList.remove('active');
+          if (state.completionSeen !== done) {
+            state.completionSeen = done;
+            state.concertCompleted = true;
+            concertReleaseNavigationLock('confirmed Concert completion');
+            concertRestoreForbiddenNavGuards();
+            addLog(`✓ Complete: "${done}"`, 'ok');
+            notifyDiscord('Activity completed', `Answered counter: ${state.answeredCount}`);
           }
-
+          setStatus('Complete: waiting for Continue');
           return;
         }
       } else {
-        state.completionSeen = done;
-        addLog(`✓ Complete: "${done}"`, 'ok');
-        setStatus('Complete');
-        notifyDiscord(
-          'Activity completed',
-          `Answered counter: ${state.answeredCount}`
-        );
-        state.running = false;
-
-        const b = document.getElementById('ln-ac-toggle');
-        if (b) {
-          b.textContent = 'Start';
-          b.classList.remove('active');
+        if (state.completionSeen !== done) {
+          state.completionSeen = done;
+          addLog(`✓ Complete: "${done}"`, 'ok');
+          notifyDiscord('Activity completed', `Answered counter: ${state.answeredCount}`);
         }
-
+        setStatus('Complete: waiting for Continue');
         return;
       }
     }
+    if (state.completionSeen) state.completionSeen = null;
 
     // IMPORTANT: Concert owns the entire tick while its route is active.
     // No Jumble/MC/WordPod/GapFill/WordPop/Forklift/etc. code is reachable.
@@ -10795,13 +12669,17 @@
       return;
     }
 
-    if (m === 'exam-gapfill' || m === 'exam-open-reading' || m === 'exam-open-listening' || m === 'exam-synonym' || m === 'exam-multiple-choice' || m === 'exam-true-false') {
+    if (m === 'exam-photo' || m === 'exam-gapfill' || m === 'exam-open-reading' || m === 'exam-open-listening' || m === 'exam-synonym' || m === 'exam-multiple-choice' || m === 'exam-true-false' || m === 'exam-dictation' || m === 'exam-who-said-what' || m === 'exam-interpret') {
       if (state.examBusy) return;
       state.examBusy = true;
       try {
-        if (m === 'exam-gapfill') await examGapfillTick();
+        if (m === 'exam-photo') await examPhotoTick();
+        else if (m === 'exam-gapfill') await examGapfillTick();
         else if (m === 'exam-multiple-choice') await examMultipleChoiceTick();
         else if (m === 'exam-true-false') await examTrueFalseTick();
+        else if (m === 'exam-dictation') await examDictationTick();
+        else if (m === 'exam-who-said-what') await whoSaidWhatTick();
+        else if (m === 'exam-interpret') await examInterpretTick();
         else await examOpenReadingTick();
       } catch (e) {
         addLog(`Exam runtime error: ${e && e.message ? e.message : e}`, 'err');
@@ -10812,7 +12690,30 @@
       return;
     }
 
+    if (m === 'dictation') {
+      if (state.dictationBusy) return;
+      state.dictationBusy = true;
+      try { await dictationTick(); }
+      catch (error) {
+        addLog(`Dictation error: ${error && error.message ? error.message : error}`, 'err');
+      } finally { state.dictationBusy = false; }
+      return;
+    }
+
     if (state.vocab.length === 0 && state.sentences.length === 0 && state.verbs.length === 0) { setStatus(`Waiting for data… (${modeLabel(m)})`); return; }
+    if (m === 'zen-memory' || m === 'zen-noughts' || m === 'race-driver') {
+      const busyKey = m === 'zen-memory' ? 'zenMemoryBusy' : m === 'zen-noughts' ? 'zenNoughtsBusy' : 'raceBusy';
+      if (state[busyKey]) return;
+      state[busyKey] = true;
+      try {
+        if (m === 'zen-memory') await zenMemoryTick();
+        else if (m === 'zen-noughts') await zenNoughtsTick();
+        else await raceDriverTick();
+      } catch (error) {
+        addLog(`${modeLabel(m)} error: ${error && error.message ? error.message : error}`, 'err');
+      } finally { state[busyKey] = false; }
+      return;
+    }
     if (m === 'jumble') return jumbleTick();
     if (m === 'mc-listening') return mcListeningTick();
 
@@ -10953,7 +12854,7 @@
     const p = document.createElement('div');
     p.id = 'ln-ac-panel';
     p.innerHTML = `
-      <div id="ln-ac-header"><span>LN Autocompleter v11.6</span><button id="ln-ac-min">–</button></div>
+      <div id="ln-ac-header"><span>LN Autocompleter v12.13</span><button id="ln-ac-min">–</button></div>
       <div id="ln-ac-body">
         <div id="ln-ac-status">Idle</div>
         <div class="ln-ac-stat"><span>Mode</span><span id="ln-ac-mode">—</span></div>
@@ -10968,7 +12869,7 @@
           <label class="ln-ac-option"><input id="ln-ac-mute" type="checkbox"> Mute audio</label>
           <label class="ln-ac-option"><input id="ln-ac-fast" type="checkbox"> Fast animations</label>
         </div>
-        <label id="ln-ac-fake-row">Reported seconds/question <input id="ln-ac-fake-seconds" type="number" min="1" max="3600" step="1"></label>
+        <div id="ln-ac-fake-row">Simulated seconds/question <input id="ln-ac-fake-min" type="number" min="1" max="3600" step="1" aria-label="Minimum simulated seconds">–<input id="ln-ac-fake-max" type="number" min="1" max="3600" step="1" aria-label="Maximum simulated seconds"></div>
         <div id="ln-ac-webhook-row">
           <input id="ln-ac-webhook" type="password" autocomplete="off" spellcheck="false" placeholder="Discord webhook URL (optional)">
           <button id="ln-ac-webhook-test" type="button">Test</button>
@@ -10998,7 +12899,7 @@
       .ln-ac-option{display:flex;align-items:center;gap:5px;cursor:pointer;user-select:none}
       .ln-ac-option input{margin:0;accent-color:#4ade80}
       #ln-ac-fake-row{display:flex;align-items:center;justify-content:space-between;margin:0 0 10px;color:#999;font-size:10.5px}
-      #ln-ac-fake-seconds{width:64px;padding:4px 6px;background:#111;border:1px solid #333;border-radius:6px;color:#ddd;font:11px ui-monospace,Menlo,monospace}
+      #ln-ac-fake-row input{width:43px;padding:4px 5px;background:#111;border:1px solid #333;border-radius:6px;color:#ddd;font:11px ui-monospace,Menlo,monospace}
       #ln-ac-webhook-row{display:flex;gap:6px;margin:0 0 10px}
       #ln-ac-webhook{min-width:0;flex:1;background:#111;border:1px solid #333;border-radius:6px;color:#ddd;padding:7px 8px;font:10px ui-monospace,Menlo,monospace;outline:none}
       #ln-ac-webhook:focus{border-color:#555}
@@ -11018,20 +12919,27 @@
 
     const muteBox = document.getElementById('ln-ac-mute');
     const fastBox = document.getElementById('ln-ac-fast');
-    const fakeSecondsBox = document.getElementById('ln-ac-fake-seconds');
+    const fakeMinBox = document.getElementById('ln-ac-fake-min');
+    const fakeMaxBox = document.getElementById('ln-ac-fake-max');
     const webhookBox = document.getElementById('ln-ac-webhook');
     const webhookTest = document.getElementById('ln-ac-webhook-test');
 
-    if (fakeSecondsBox) {
-      fakeSecondsBox.value = String(state.fakeTimeSeconds);
-      fakeSecondsBox.addEventListener('change', () => {
-        const value = Math.round(Number(fakeSecondsBox.value));
-        state.fakeTimeSeconds = Number.isFinite(value)
-          ? Math.max(1, Math.min(3600, value)) : 30;
-        fakeSecondsBox.value = String(state.fakeTimeSeconds);
-        saveStringSetting('fakeTimeSeconds', state.fakeTimeSeconds);
-        addLog(`Reported time: ${state.fakeTimeSeconds}s per question`, 'ok');
-      });
+    if (fakeMinBox && fakeMaxBox) {
+      fakeMinBox.value = String(state.fakeTimeMin);
+      fakeMaxBox.value = String(state.fakeTimeMax);
+      const updateRange = () => {
+        const min = Math.max(1, Math.min(3600, Math.round(Number(fakeMinBox.value)) || 20));
+        const max = Math.max(min, Math.min(3600, Math.round(Number(fakeMaxBox.value)) || 30));
+        state.fakeTimeMin = min;
+        state.fakeTimeMax = max;
+        fakeMinBox.value = String(min);
+        fakeMaxBox.value = String(max);
+        saveStringSetting('fakeTimeMin', min);
+        saveStringSetting('fakeTimeMax', max);
+        addLog(`Simulated time range: ${min}–${max}s per question`, 'ok');
+      };
+      fakeMinBox.addEventListener('change', updateRange);
+      fakeMaxBox.addEventListener('change', updateRange);
     }
 
     if (webhookBox) {
@@ -11110,6 +13018,16 @@
       else if (state.mode === 'fridge') { resetFridgeState(); addLog('↺'); }
       else if (state.mode === 'verb-matcher') { resetVerbState(); addLog('↺'); }
       else if (state.mode === 'jigsaw') { resetJigsawState(); addLog('↺'); }
+      else if (state.mode === 'zen-memory') { state.zenMemoryLastCount = 0; addLog('↺'); }
+      else if (state.mode === 'zen-noughts') { state.zenNoughtsLastCount = 0; state.zenNoughtsNextMoveAt = 0; addLog('↺'); }
+      else if (state.mode === 'race-driver') { raceDriverBoost(false); state.raceLastQuestion = ''; state.raceLastChunks = 0; addLog('↺'); }
+      else if (state.mode === 'dictation') {
+        state.dictationSubmitted = false;
+        state.dictationSawHidden = false;
+        state.dictationPlayAt = 0;
+        state.dictationLastAudio = '';
+        addLog('↺');
+      }
       else if (state.mode === 'forklift') { resetForkliftState(); addLog('↺'); }
       else if (state.mode === 'ocean-cleaner') { resetOceanState(); addLog('↺'); }
       else if (state.mode === 'gapfill') { resetGapFillState(); addLog('↺'); }
@@ -11118,11 +13036,28 @@
       else if (state.mode === 'skyrise') { resetSkyRiseState(); addLog('↺'); }
       else if (state.mode === 'concert-speaking') { resetConcertState(); addLog('↺'); }
       else if (state.mode === 'exam-gapfill') { state.examGapOrder = []; state.examGapIndex = 0; state.examGapSubmitted = false; addLog('↺'); }
+      else if (state.mode === 'exam-who-said-what') { state.whoSaidWhatSubmitted = false; addLog('↺'); }
+      else if (state.mode === 'exam-photo') { state.examPhotoSubmittedKey = ''; addLog('↺'); }
+      else if (state.mode === 'exam-interpret') {
+        state.examInterpretSubmitted = false;
+        state.lastInterpretPrompt = null;
+        state.interpretTranslating = false;
+        state.interpretCache.clear();
+        state.interpretLogged.clear();
+        addLog('↺');
+      }
+      else if (state.mode === 'exam-dictation') { state.examDictationSubmitted = false; addLog('↺'); }
       else if (state.mode === 'exam-open-reading' || state.mode === 'exam-open-listening' || state.mode === 'exam-synonym' || state.mode === 'exam-multiple-choice' || state.mode === 'exam-true-false') { state.examSubmitted = new Set(); addLog('↺'); }
       else if (state.mode === 'mc2-listening' || state.mode === 'mc2-reading') { resetMC2State(); addLog('↺'); }
       else { state.currentAnswer = null; state.currentEntry = null; state.currentPrompt = null; state.lastAudioUrl = null; state.lastAnsweredKey = null; setAudioLabel(''); setPromptLabel(''); addLog('↺'); }
     });
     document.getElementById('ln-ac-play').addEventListener('click', () => {
+      if (state.mode === 'dictation') {
+        const play = dictationPlayButton();
+        if (play) emitOnObject(play, 'keyup');
+        else addLog('No Dictation play button', 'err');
+        return;
+      }
       if (state.mode === 'wordpod-listening') {
         const audio = wordPodFindAudioButton();
 
@@ -11180,9 +13115,9 @@
     state.panelInjected = true; updateModeButtons(null); return true;
   }
   function updateModeButtons(m) {
-    const pl = document.getElementById('ln-ac-play'); if (pl) pl.style.display = (m === 'mc-listening' || m === 'mc2-listening' || m === 'wordpod-listening' || m === 'wordpop-listening') ? '' : 'none';
-    const ps = document.getElementById('ln-ac-prompt'); if (ps) { const r = ps.closest('.ln-ac-stat'); if (r) r.style.display = (m === 'exam-gapfill' || m === 'exam-synonym' || m === 'exam-open-listening' || m === 'exam-true-false' || m === 'exam-multiple-choice' || m === 'exam-open-reading' || m === 'mc-reading' || m === 'mc2-reading' || m === 'wordpod-reading' || m === 'wordpod-listening' || m === 'skyrise' || m === 'concert-speaking' || m === 'fridge' || m === 'verb-matcher' || m === 'jigsaw' || m === 'forklift' || m === 'ocean-cleaner' || m === 'gapfill') ? '' : 'none'; }
-    const as = document.getElementById('ln-ac-audio'); if (as) { const r = as.closest('.ln-ac-stat'); if (r) r.style.display = (m === 'mc-listening' || m === 'mc2-listening' || m === 'wordpod-listening' || m === 'wordpop-listening') ? '' : 'none'; }
+    const pl = document.getElementById('ln-ac-play'); if (pl) pl.style.display = (m === 'dictation' || m === 'mc-listening' || m === 'mc2-listening' || m === 'wordpod-listening' || m === 'wordpop-listening') ? '' : 'none';
+    const ps = document.getElementById('ln-ac-prompt'); if (ps) { const r = ps.closest('.ln-ac-stat'); if (r) r.style.display = (m === 'dictation' || m === 'zen-memory' || m === 'zen-noughts' || m === 'race-driver' || m === 'exam-interpret' || m === 'exam-who-said-what' || m === 'exam-dictation' || m === 'exam-gapfill' || m === 'exam-synonym' || m === 'exam-open-listening' || m === 'exam-true-false' || m === 'exam-multiple-choice' || m === 'exam-open-reading' || m === 'mc-reading' || m === 'mc2-reading' || m === 'wordpod-reading' || m === 'wordpod-listening' || m === 'skyrise' || m === 'concert-speaking' || m === 'fridge' || m === 'verb-matcher' || m === 'jigsaw' || m === 'forklift' || m === 'ocean-cleaner' || m === 'gapfill') ? '' : 'none'; }
+    const as = document.getElementById('ln-ac-audio'); if (as) { const r = as.closest('.ln-ac-stat'); if (r) r.style.display = (m === 'dictation' || m === 'mc-listening' || m === 'mc2-listening' || m === 'wordpod-listening' || m === 'wordpop-listening') ? '' : 'none'; }
     const ts = document.getElementById('ln-ac-target'); if (ts) { const r = ts.closest('.ln-ac-stat'); if (r) r.style.display = (m === 'jumble') ? '' : 'none'; }
     const ss = document.getElementById('ln-ac-seq'); if (ss) { const r = ss.closest('.ln-ac-stat'); if (r) r.style.display = (m === 'jumble') ? '' : 'none'; }
   }
@@ -11199,6 +13134,14 @@
     if(e)e.textContent=n;
 
     const num = Number(n) || 0;
+    if (state.running) {
+      const activityCount = Math.max(0, num - state.fakeTimeAnswerBase);
+      while (state.fakeTimeLoggedCount < activityCount) {
+        const seconds = fakeTimeSample(state.fakeTimeLoggedCount);
+        state.fakeTimeLoggedCount++;
+        addLog(`Question ${state.fakeTimeLoggedCount}: simulated ${seconds}s`, 'ok');
+      }
+    }
     if (num > state.webhookLastAnswered) {
       // GapFill sends its detailed answer separately; other modes get a compact
       // generic answer event here.
@@ -11215,7 +13158,7 @@
     const b = document.getElementById('ln-ac-toggle');
 
     if (state.running) {
-      state.fakeTimeAnswerBase = state.answeredCount;
+      resetFakeTimeActivity();
       hookServicesFakeTime();
       state.completionSeen = null;
       state.concertCompleted = false;
@@ -11261,6 +13204,7 @@
         });
       }
     } else {
+      raceDriverBoost(false);
       b.textContent = 'Start';
       b.classList.remove('active');
 
@@ -11885,45 +13829,29 @@
       }
     }
     if (liveMode === 'jigsaw') {
-      const jp = collectJigsawPieces(true);
-      const je = collectJigsawTargets();
-
-      addLog(
-        `Jigsaw data: ${state.verbs.length}, Done: ${state.jigsawDone.size}, Fails: ${state.jigsawFails}`
-      );
-
-      addLog(`Blue pieces (${jp.length}):`);
-      jp.forEach(p => {
-        const api = state.verbs.find(v => verbKey(v.translatedVerb) === verbKey(p.label));
-        const sections = api ? verbSections(api) : [];
-        addLog(
-          `  "${p.label}" @ x=${p.bounds.x|0} y=${p.bounds.y|0} ` +
-          `API=${api ? api.uid : '?'} sections=[${sections.map(x => JSON.stringify(x)).join(', ')}]`
-        );
-      });
-
-      addLog(`White ending pieces (${je.length}):`);
-      je.forEach((t, i) => addLog(
-        `  #${i + 1} ${JSON.stringify(t.label)} key=${t.key} ` +
-        `@ x=${t.bounds.x|0} y=${t.bounds.y|0} ` +
-        `events=${verbEventNames(t.obj).join(',') || '(none)'}`
+      const board = collectJigsawBoard();
+      const entries = state.verbs.map(v => {
+        const sections = verbSections(v);
+        return sections.length >= 3 ? {
+          uid: String(v.uid || ''),
+          slotKey: jigsawVerbKey(sections[0] + sections[1]),
+          pieceKey: jigsawVerbKey(sections[2])
+        } : null;
+      }).filter(Boolean);
+      const placed = jigsawPlacedEntries(entries, board);
+      addLog(`Jigsaw: ${board.pieces.length} blue pieces, ${board.slots.length} slots, ${placed.size}/${entries.length} placed`);
+      board.pieces.forEach(p => addLog(
+        `  blue ${JSON.stringify(p.labels[0])} key=${p.key} @ ${p.bounds.x|0},${p.bounds.y|0} events=${verbEventNames(p.obj).join(',') || '(none)'}`
       ));
-
-      addLog('API mapping used by solver: translatedVerb blue piece → LAST <section> white piece');
+      board.slots.forEach(t => addLog(
+        `  slot ${JSON.stringify(t.labels)} key=${t.key} uid=${t.entryUid || '?'} ` +
+        `occupied=${board.pieces.find(p => jigsawPieceInSlot(p, t))?.key || 'no'} ` +
+        `@ ${t.bounds.x|0},${t.bounds.y|0} events=${verbEventNames(t.obj).join(',') || '(none)'}`
+      ));
       state.verbs.forEach(v => {
         const sections = verbSections(v);
-        addLog(
-          `  uid=${v.uid} "${v.translatedVerb}" blue contains ` +
-          `[${sections.slice(0, -1).map(x => JSON.stringify(x)).join(', ')}] → ` +
-          `white ${JSON.stringify(jigsawFinalSection(v))}`
-        );
+        addLog(`  uid=${v.uid} sections=${JSON.stringify(sections)} ${sections.length >= 3 ? `slot=${jigsawVerbKey(sections[0] + sections[1])} piece=${jigsawVerbKey(sections[2])}` : 'missing sections'}`);
       });
-
-      addLog(`Used white positions: ${state.jigsawUsedTargetPositions.length}`);
-      addLog(
-        `Jigsaw delays: blue→white=${CONFIG.jigsawBetweenClicksMs}ms, ` +
-        `after pair=${CONFIG.jigsawAfterPairMs}ms; busy=${state.jigsawBusy}`
-      );
     }
     addLog('Completion check: ' + (detectCompletion() || 'no'));
   }
