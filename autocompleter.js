@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LanguageNut Autocompleter (Jumble + MC + Fridge)
 // @namespace    languagenut-autocompleter
-// @version      10.9
+// @version      11.6
 // @description  Autocompletes LanguageNut vocab/sentence activities including WordPod, Skyrise and Concert Speaking
 // @author       You
 // @match        *://*.languagenut.com/*
@@ -46,7 +46,10 @@
     gapAfterSubmitMs: 700,
     gapMaxFails: 8,
 
-    fastAnimationSpeed: 4,
+    // Fast mode is intentionally close to instant.  The old 4× ticker speed
+    // still left CSS tweens and solver settle delays visible, so the toggle
+    // now uses a high time scale and collapses our own waits as well.
+    fastAnimationSpeed: 100,
 
     mc2AfterPlayMs: 350,
     mc2AfterClickMs: 180,
@@ -131,7 +134,10 @@
     concertNavLockRestoring: false,
     concertCompleted: false,
     concertHadQuestion: false,
-    examTranslations: [], examBusy: false, examSubmitted: new Set(),
+    examTranslations: [], examOriginalText: '', examBusy: false, examSubmitted: new Set(),
+    examGapOrder: [], examGapIndex: 0, examGapBusy: false, examGapSubmitted: false,
+    examContinueBusy: false, examContinueAt: 0,
+    fakeTimeSeconds: 30, fakeTimeAnswerBase: 0, fakeTimeServicesHooked: false,
     discordWebhook: '', webhookLastAnswered: 0, webhookSending: false,
     wordPopFails: 0, wordPopLastKey: null, wordPopBusy: false,
     wordPopAudioBusy: false, wordPopLastSignature: null,
@@ -172,6 +178,60 @@
   state.muteAudio = loadBoolSetting('muteAudio', false);
   state.fastAnimations = loadBoolSetting('fastAnimations', false);
   state.discordWebhook = loadStringSetting('discordWebhook', '');
+  state.fakeTimeSeconds = Math.max(1, Math.min(3600,
+    Number(loadStringSetting('fakeTimeSeconds', '30')) || 30
+  ));
+
+  function fakeTimeMilliseconds(questionCount) {
+    const count = Math.max(1, Number(questionCount) ||
+      state.answeredCount - state.fakeTimeAnswerBase || 1);
+    return Math.round(count * state.fakeTimeSeconds * 1000);
+  }
+
+  function hookServicesFakeTime() {
+    const services = window.Services;
+    if (!services || typeof services.apiCallToken !== 'function' || services.apiCallToken.__lnFakeTime) return;
+    const original = services.apiCallToken;
+    const wrapped = function (endpoint, data) {
+      if (state.running && data && typeof data === 'object') {
+        if (/gameDataController\/addGameScore/i.test(String(endpoint))) {
+          const stamps = data.QLCAEWIJSXDC551;
+          const count = Math.max(1, Number(data.vocabNumber) ||
+            (Array.isArray(stamps) ? stamps.length : 0) ||
+            state.answeredCount - state.fakeTimeAnswerBase || 1);
+          data.awrtfuoivg = fakeTimeMilliseconds(count);
+          if (Array.isArray(stamps)) {
+            const now = Date.now();
+            for (let i = 0; i < stamps.length; i++) {
+              if (Array.isArray(stamps[i]) && stamps[i].length > 1) {
+                stamps[i][1] = now - (stamps.length - 1 - i) * state.fakeTimeSeconds * 1000;
+              }
+            }
+          }
+          addLog(`Reported game time: ${Math.round(data.awrtfuoivg / 1000)}s`, 'ok');
+        } else if (/examTranslationController\/addExamDataAnswer(?:Text|Audio)/i.test(String(endpoint))) {
+          data.timeTaken = fakeTimeMilliseconds(1);
+          addLog(`Reported exam time: ${state.fakeTimeSeconds}s`, 'ok');
+        }
+      }
+      return original.apply(this, arguments);
+    };
+    wrapped.__lnFakeTime = true;
+    services.apiCallToken = wrapped;
+    state.fakeTimeServicesHooked = true;
+  }
+
+  function rewriteFakeTimeBody(url, body) {
+    if (!state.running || typeof body !== 'string') return body;
+    const endpoint = String(url || '');
+    const isScore = /gameDataController\/addGameScore/i.test(endpoint);
+    const isExamText = /examTranslationController\/addExamDataAnswerText/i.test(endpoint);
+    if (!isScore && !isExamText) return body;
+    const params = new URLSearchParams(body);
+    if (isScore) params.set('awrtfuoivg', String(fakeTimeMilliseconds(params.get('vocabNumber'))));
+    else params.set('timeTaken', String(fakeTimeMilliseconds(1)));
+    return params.toString();
+  }
 
   function validDiscordWebhook(url) {
     return /^https:\/\/(?:(?:canary|ptb)\.)?discord(?:app)?\.com\/api\/webhooks\/\d+\/[A-Za-z0-9._-]+(?:\?.*)?$/i.test(
@@ -235,13 +295,10 @@
   }
 
   function applyAnimationSpeed() {
-    // Jigsaw's blue→white pointer sequence is timing-sensitive. The solver in
-    // v7.1 was stable at normal game speed, so keep Jigsaw at 1× even when the
-    // user's global Fast Animations option is enabled.
-    const speed =
-      state.fastAnimations && state.mode !== 'jigsaw'
-        ? CONFIG.fastAnimationSpeed
-        : 1;
+    // Apply the same speed to every activity, including Jigsaw.  Fast mode
+    // also collapses the solver waits below, so there is no leftover visual
+    // animation in one mode while the others run instantly.
+    const speed = state.fastAnimations ? CONFIG.fastAnimationSpeed : 1;
 
     try {
       if (
@@ -280,6 +337,30 @@
         typeof window.TweenLite.globalTimeScale === 'function'
       ) {
         window.TweenLite.globalTimeScale(speed);
+      }
+    } catch (_) {}
+
+    // LanguageNut uses a mixture of Pixi tweens and ordinary DOM CSS
+    // transitions.  A Pixi time scale cannot affect the latter, so maintain a
+    // small page style that disables them while Fast animations is enabled.
+    try {
+      let style = document.getElementById('ln-ac-instant-animations');
+      if (state.fastAnimations) {
+        if (!style) {
+          style = document.createElement('style');
+          style.id = 'ln-ac-instant-animations';
+          (document.head || document.documentElement).appendChild(style);
+        }
+        style.textContent =
+          '*,*::before,*::after{' +
+          'animation-duration:0s!important;' +
+          'animation-delay:0s!important;' +
+          'transition-duration:0s!important;' +
+          'transition-delay:0s!important;' +
+          'scroll-behavior:auto!important;' +
+          '}';
+      } else if (style) {
+        style.remove();
       }
     } catch (_) {}
   }
@@ -404,16 +485,37 @@
     try {
       const data = typeof body === 'string' ? JSON.parse(body) : body;
       if (!data || !Array.isArray(data.examTranslations)) return;
+      state.examOriginalText = String(data.examDataOriginal?.text || '').trim();
       const parsed = data.examTranslations.map(entry => {
         const xml = new DOMParser().parseFromString(String(entry.other || ''), 'text/xml');
+        const questionNode =
+          xml.querySelector('question') ||
+          xml.querySelector('synonym') ||
+          xml.querySelector('statement') ||
+          xml.querySelector('prompt');
+        const answerNode =
+          xml.querySelector('correct') ||
+          xml.querySelector('true') ||
+          xml.querySelector('false') ||
+          xml.querySelector('removed') ||
+          xml.querySelector('answer') ||
+          xml.querySelector('interpret') ||
+          xml.querySelector('interpretation') ||
+          xml.querySelector('translation') ||
+          xml.querySelector('text');
         return {
           uid: String(entry.uid || ''),
-          question: String(xml.querySelector('question')?.textContent || '').trim(),
-          answer: String(xml.querySelector('correct')?.textContent || '').trim()
+          question: String(questionNode?.textContent || '').trim(),
+          answer: String(answerNode?.textContent || '').trim(),
+          position: String(xml.querySelector('position')?.textContent || '').trim(),
+          kind: xml.querySelector('removed') ? 'gapfill' : 'exam'
         };
-      }).filter(entry => entry.question && entry.answer);
+      }).filter(entry => entry.answer && (entry.question || entry.kind === 'gapfill'));
       state.examTranslations = parsed;
       state.examSubmitted = new Set();
+      state.examGapOrder = [];
+      state.examGapIndex = 0;
+      state.examGapSubmitted = false;
       addLog(`Exam answers loaded: ${parsed.length}`, 'ok');
       setVocabCount(state.vocab.length + state.sentences.length + state.verbs.length + parsed.length);
     } catch (e) { log('exam translation parse failed', e); }
@@ -422,6 +524,10 @@
     window.fetch = function (input) {
       const url = typeof input === 'string' ? input : (input && input.url);
       if (CONFIG.logAllFetches && isInterestingUrl(url)) log('fetch →', String(url).slice(0, 120));
+      if (arguments[1] && typeof arguments[1].body === 'string') {
+        const body = rewriteFakeTimeBody(url, arguments[1].body);
+        if (body !== arguments[1].body) arguments[1] = {...arguments[1], body};
+      }
       const p = orig.apply(this, arguments);
       if (isVocabUrl(url)) p.then(r => r.clone().text().then(ingestVocab).catch(()=>{}));
       if (isSentenceUrl(url)) p.then(r => r.clone().text().then(ingestSentences).catch(()=>{}));
@@ -438,8 +544,21 @@
     };
   })();
   (function () { const open = XMLHttpRequest.prototype.open, send = XMLHttpRequest.prototype.send;
-    XMLHttpRequest.prototype.open = function (m, url) { this.__ln_url = url; if (CONFIG.logAllFetches && isInterestingUrl(url)) log('xhr →', String(url).slice(0, 120)); return open.apply(this, arguments); };
+    XMLHttpRequest.prototype.open = function (m, url) {
+      if (state.running && /examTranslationController\/addExamDataAnswerAudio/i.test(String(url))) {
+        const reported = fakeTimeMilliseconds(1);
+        url = String(url).replace(/([?&]timeTaken=)\d+/i, `$1${reported}`);
+        arguments[1] = url;
+        addLog(`Reported exam audio time: ${state.fakeTimeSeconds}s`, 'ok');
+      }
+      this.__ln_url = url;
+      if (CONFIG.logAllFetches && isInterestingUrl(url)) log('xhr →', String(url).slice(0, 120));
+      return open.apply(this, arguments);
+    };
     XMLHttpRequest.prototype.send = function () {
+      if (typeof arguments[0] === 'string') {
+        arguments[0] = rewriteFakeTimeBody(this.__ln_url, arguments[0]);
+      }
       this.addEventListener('load', function () {
         if (isVocabUrl(this.__ln_url)) ingestVocab(this.responseText);
         if (isSentenceUrl(this.__ln_url)) ingestSentences(this.responseText);
@@ -719,7 +838,13 @@
     return true;
   }
 
-  const sleep = ms => ms > 0 ? new Promise(r => setTimeout(r, ms)) : Promise.resolve();
+  const sleep = ms => {
+    // Fast mode is also used by the activity solvers.  Collapsing these waits
+    // is what makes clicks and answer submission happen immediately instead
+    // of only accelerating Pixi's visual ticker.
+    const delay = state.fastAnimations ? 0 : Number(ms) || 0;
+    return delay > 0 ? new Promise(r => setTimeout(r, delay)) : Promise.resolve();
+  };
 
   function cleanLetters(s) { return String(s).normalize('NFC').replace(/[^\p{L}]/gu, ''); }
   function sortLetters(s) { return cleanLetters(s).toLowerCase().split('').sort().join(''); }
@@ -788,7 +913,20 @@
       const t = o.text.trim();
       if (t.length > 150) return;
       let m = t.match(/(\d+)\s*\/\s*(\d+)/);
-      if (m && m[1] === m[2] && parseInt(m[1], 10) >= 2) { r = t; return; }
+      if (m && m[1] === m[2] && parseInt(m[1], 10) >= 2) {
+        // Exam progress can briefly show 2/2, 3/3, etc. after a page of
+        // questions. Only treat n/n as final when it reaches the loaded exam
+        // size; otherwise the old generic check stopped MC exams after Q2.
+        const exam = /^exam-/.test(String(state.mode || ''));
+        const total = exam
+          ? Math.max(
+            examGapfillEntries().length,
+            state.examTranslations.length,
+            Number(m[2])
+          )
+          : Number(m[2]);
+        if (!exam || parseInt(m[1], 10) >= total) { r = t; return; }
+      }
       m = t.match(/(\d+)\s+out of\s+(\d+)/i);
       if (m && m[1] === m[2] && parseInt(m[1], 10) >= 2) { r = t; return; }
       if (/\b(quiz|activity|homework|exercise)\s+(is\s+)?(complete|completed|finished|done)\b/i.test(t)) { r = t; return; }
@@ -809,12 +947,18 @@
   }
 
   // ============ MODE ============
-  function modeLabel(m) { if (m === 'exam-open-reading') return 'Exam Open Reading'; if (m === 'jumble') return 'Jumble'; if (m === 'mc-listening') return 'MC Listening'; if (m === 'mc-reading') return 'MC Reading'; if (m === 'mc2-listening') return 'Multiple Choice 2 Listening'; if (m === 'mc2-reading') return 'Multiple Choice 2 Reading'; if (m === 'wordpod-reading') return 'WordPod Reading'; if (m === 'wordpod-listening') return 'WordPod Listening'; if (m === 'skyrise') return 'Skyrise'; if (m === 'concert-speaking') return 'Concert Speaking'; if (m === 'wordpop-listening') return 'WordPop Listening'; if (m === 'ocean-cleaner') return 'Ocean Cleaner'; if (m === 'gapfill') return 'GapFill'; if (m === 'fridge') return 'Fridge / Sentence'; if (m === 'verb-matcher') return 'Verb Matcher'; if (m === 'jigsaw') return 'Jigsaw'; if (m === 'forklift') return 'Forklift'; return '—'; }
+  function modeLabel(m) { if (m === 'exam-interpret') return 'Exam Interpret'; if (m === 'exam-gapfill') return 'Exam GapFill'; if (m === 'exam-synonym') return 'Exam Synonym'; if (m === 'exam-open-listening') return 'Exam Open Listening'; if (m === 'exam-true-false') return 'Exam True / False'; if (m === 'exam-multiple-choice') return 'Exam Multiple Choice'; if (m === 'exam-open-reading') return 'Exam Open Reading'; if (m === 'jumble') return 'Jumble'; if (m === 'mc-listening') return 'MC Listening'; if (m === 'mc-reading') return 'MC Reading'; if (m === 'mc2-listening') return 'Multiple Choice 2 Listening'; if (m === 'mc2-reading') return 'Multiple Choice 2 Reading'; if (m === 'wordpod-reading') return 'WordPod Reading'; if (m === 'wordpod-listening') return 'WordPod Listening'; if (m === 'skyrise') return 'Skyrise'; if (m === 'concert-speaking') return 'Concert Speaking'; if (m === 'wordpop-listening') return 'WordPop Listening'; if (m === 'ocean-cleaner') return 'Ocean Cleaner'; if (m === 'gapfill') return 'GapFill'; if (m === 'fridge') return 'Fridge / Sentence'; if (m === 'verb-matcher') return 'Verb Matcher'; if (m === 'jigsaw') return 'Jigsaw'; if (m === 'forklift') return 'Forklift'; return '—'; }
   function detectMode() {
     const u = location.href;
 
     // Strong URL identifiers first.
     if (/#\/alevelOpenReading(?:[/?]|$)/i.test(u)) return 'exam-open-reading';
+    if (/#\/alevelOpenListening(?:[/?]|$)/i.test(u)) return 'exam-open-listening';
+    if (/#\/alevelSynonym(?:[/?]|$)/i.test(u)) return 'exam-synonym';
+    if (/#\/(?:Interpret|interpret)(?:[/?]|$)/i.test(u)) return 'exam-interpret';
+    if (/#\/GapfillExam(?:Alt)?(?:[/?]|$)/i.test(u)) return 'exam-gapfill';
+    if (/#\/(?:MultiChoiceExam|MultiChoiceListeningExam)(?:Alt)?(?:[/?]|$)/i.test(u)) return 'exam-multiple-choice';
+    if (/#\/(?:TrueFalseExam|TrueFalseListeningExam)(?:Alt)?(?:[/?]|$)/i.test(u)) return 'exam-true-false';
     if (/\/ZenJumble\b/i.test(u)) return 'jumble';
     if (/\/ZenListening\b/i.test(u)) return 'mc-listening';
     if (/\/ZenReading\b/i.test(u)) return 'mc-reading';
@@ -9918,6 +10062,218 @@
   }
 
   // ============ OPEN READING EXAM ============
+  function examGapfillEntries() {
+    return state.examTranslations.filter(entry =>
+      entry && entry.kind === 'gapfill' && String(entry.answer || '').trim()
+    );
+  }
+
+  function buildExamGapfillOrder() {
+    const entries = examGapfillEntries().slice();
+    const source = String(state.examOriginalText || '');
+    const lower = source.toLocaleLowerCase();
+    const occurrences = new Map();
+
+    for (const entry of entries) {
+      const word = String(entry.answer || '').trim();
+      const needle = word.toLocaleLowerCase();
+      const occurrence = occurrences.get(needle) || 0;
+      let location = -1;
+      let from = 0;
+      let foundCount = 0;
+      while (needle && from <= lower.length) {
+        const candidate = lower.indexOf(needle, from);
+        if (candidate < 0) break;
+        const before = candidate > 0 ? lower[candidate - 1] : '';
+        const after = lower[candidate + needle.length] || '';
+        const wholeWord =
+          !/[\p{L}\p{N}]/u.test(before) &&
+          !/[\p{L}\p{N}]/u.test(after);
+        if (wholeWord) {
+          if (foundCount === occurrence) {
+            location = candidate;
+            break;
+          }
+          foundCount++;
+        }
+        from = candidate + Math.max(1, needle.length);
+      }
+      occurrences.set(needle, occurrence + 1);
+      entry.location = location < 0 ? Number.MAX_SAFE_INTEGER : location;
+    }
+
+    entries.sort((a, b) => a.location - b.location);
+    return entries;
+  }
+
+  function collectExamGapfillBank() {
+    const a = state.pixiApp;
+    if (!a) return [];
+    const out = [];
+    const seen = new Set();
+
+    walk(a.stage, obj => {
+      if (seen.has(obj) || !isVisible(obj, a.stage)) return;
+      if (!verbEventNames(obj).some(name =>
+        /^(?:pointerup|click|tap)$/i.test(name)
+      )) return;
+
+      const bounds = boundsOf(obj);
+      if (!bounds || bounds.width < 80 || bounds.height < 20) return;
+
+      let hasWordBackground = false;
+      const labels = [];
+      walk(obj, child => {
+        const texture = `${fullTextureName(child)} ${textureName(child)}`;
+        if (/missingWordBackground/i.test(texture)) hasWordBackground = true;
+        if (typeof child.text === 'string' && child.text.trim()) {
+          labels.push(child.text.trim());
+        }
+      });
+
+      const label = labels.find(text =>
+        text.length > 0 && !/^(?:submit|reset)$/i.test(text)
+      );
+      if (!hasWordBackground || !label) return;
+
+      seen.add(obj);
+      out.push({obj, label, bounds});
+    });
+
+    out.sort((a, b) => a.bounds.y - b.bounds.y || a.bounds.x - b.bounds.x);
+    return out;
+  }
+
+  function collectExamGapfillBlanks() {
+    const a = state.pixiApp;
+    if (!a) return [];
+    const out = [];
+
+    walk(a.stage, obj => {
+      if (!isVisible(obj, a.stage)) return;
+      if (!verbEventNames(obj).some(name =>
+        /^(?:pointerup|click|tap)$/i.test(name)
+      )) return;
+      const bounds = boundsOf(obj);
+      if (!bounds || bounds.width < 70 || bounds.width > 140 ||
+          bounds.height < 15 || bounds.height > 40 ||
+          bounds.x > 700 || bounds.y < 100 || bounds.y > 380) return;
+
+      let hasBankTexture = false;
+      walk(obj, child => {
+        if (/missingWordBackground/i.test(
+          `${fullTextureName(child)} ${textureName(child)}`
+        )) hasBankTexture = true;
+      });
+      if (hasBankTexture) return;
+      out.push({obj, bounds});
+    });
+
+    // The exam layout creates exactly one interactive 105×25 object per gap.
+    // De-duplicate nested hitboxes that share the same rectangle.
+    const unique = [];
+    for (const item of out) {
+      if (unique.some(prev =>
+        Math.abs(prev.bounds.x - item.bounds.x) < 2 &&
+        Math.abs(prev.bounds.y - item.bounds.y) < 2 &&
+        Math.abs(prev.bounds.width - item.bounds.width) < 2
+      )) continue;
+      unique.push(item);
+    }
+    unique.sort((a, b) => a.bounds.y - b.bounds.y || a.bounds.x - b.bounds.x);
+    return unique;
+  }
+
+  function examGapfillSubmitControl() {
+    const a = state.pixiApp;
+    if (!a) return null;
+    let found = null;
+    walk(a.stage, obj => {
+      if (found || !isVisible(obj, a.stage)) return;
+      if (!verbEventNames(obj).some(name =>
+        /^(?:pointerup|click|tap)$/i.test(name)
+      )) return;
+      const texture = `${fullTextureName(obj)} ${textureName(obj)}`;
+      const labels = [];
+      walk(obj, child => {
+        if (typeof child.text === 'string' && child.text.trim()) {
+          labels.push(child.text.trim());
+        }
+      });
+      if (!/^submit$/i.test(labels[0] || '') &&
+          !/buttonBackground/i.test(texture)) return;
+      const bounds = boundsOf(obj);
+      if (bounds && bounds.x > 700 && bounds.y > 400) {
+        found = {obj, bounds};
+      }
+    });
+    return found;
+  }
+
+  async function examGapfillTick() {
+    const entries = examGapfillEntries();
+    if (!entries.length || !state.examOriginalText) {
+      setStatus('Exam GapFill: waiting for answers');
+      return;
+    }
+    if (!state.examGapOrder.length) {
+      state.examGapOrder = buildExamGapfillOrder();
+      state.examGapIndex = 0;
+      addLog(`Exam GapFill order: ${state.examGapOrder.map(e => e.answer).join(' → ')}`, 'ok');
+      setProgress(0, state.examGapOrder.length);
+    }
+    if (state.examGapSubmitted) {
+      setStatus('Exam GapFill: submitted — waiting for completion');
+      return;
+    }
+
+    const bank = collectExamGapfillBank();
+    if (state.examGapIndex < state.examGapOrder.length) {
+      const wanted = state.examGapOrder[state.examGapIndex].answer;
+      const match = bank.find(item =>
+        normaliseText(item.label) === normaliseText(wanted)
+      );
+      if (!match) {
+        setStatus(`Exam GapFill: waiting for “${wanted}”`);
+        return;
+      }
+
+      const clicked = emitOnObject(match.obj, 'pointerup');
+      if (!clicked) {
+        const b = match.bounds;
+        await safeCanvasPointerClickWorld(
+          b.x + b.width / 2, b.y + b.height / 2, '#4ade80', 120
+        );
+      } else {
+        await sleep(120);
+      }
+      state.examGapIndex++;
+      setProgress(state.examGapIndex, state.examGapOrder.length);
+      addLog(`Exam GapFill placed “${wanted}” (${state.examGapIndex}/${state.examGapOrder.length})`, 'ok');
+      return;
+    }
+
+    const submit = examGapfillSubmitControl();
+    if (!submit) {
+      setStatus('Exam GapFill: waiting for Submit');
+      return;
+    }
+    const clicked = emitOnObject(submit.obj, 'pointerup');
+    if (!clicked) {
+      const b = submit.bounds;
+      await safeCanvasPointerClickWorld(
+        b.x + b.width / 2, b.y + b.height / 2, '#4ade80', 200
+      );
+    } else {
+      await sleep(200);
+    }
+    state.examGapSubmitted = true;
+    state.answeredCount++;
+    setAnsweredCount(state.answeredCount);
+    addLog('Exam GapFill submitted', 'ok');
+    setStatus('Exam GapFill: submitted');
+  }
+
   function examCurrentEntry() {
     const a = state.pixiApp;
     if (!a || !state.examTranslations.length) return null;
@@ -9938,7 +10294,7 @@
 
   function examInput() {
     const input = document.getElementById('textInputChina');
-    if (!(input instanceof HTMLTextAreaElement)) return null;
+    if (!(input instanceof HTMLTextAreaElement) && !(input instanceof HTMLInputElement)) return null;
     const b = input.getBoundingClientRect();
     return b.width > 0 && b.height > 0 ? input : null;
   }
@@ -9960,6 +10316,24 @@
     return found;
   }
 
+  function examSubmitDomControl() {
+    try {
+      const nodes = document.querySelectorAll(
+        'button, input[type="button"], input[type="submit"], [role="button"]'
+      );
+      return Array.from(nodes).find(node => {
+        if (!node || node.closest('#ln-ac-panel')) return false;
+        const text = String(
+          node.innerText || node.value || node.getAttribute('aria-label') || ''
+        ).trim();
+        const r = node.getBoundingClientRect();
+        return /^submit!?$/i.test(text) && r.width > 20 && r.height > 15;
+      }) || null;
+    } catch (_) {
+      return null;
+    }
+  }
+
   async function examOpenReadingTick() {
     if (!state.examTranslations.length) {
       setStatus('Exam: waiting for answers');
@@ -9978,13 +10352,16 @@
 
     const input = examInput();
     const submit = examSubmitControl();
-    if (!input || !submit) {
+    const domSubmit = submit ? null : examSubmitDomControl();
+    if (!input || (!submit && !domSubmit)) {
       setStatus('Exam: waiting for answer controls');
       return;
     }
 
     input.focus();
-    const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
+    const inputPrototype = input instanceof HTMLTextAreaElement
+      ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(inputPrototype, 'value')?.set;
     if (setter) setter.call(input, entry.answer);
     else input.value = entry.answer;
     input.dispatchEvent(new InputEvent('input', {
@@ -9998,10 +10375,19 @@
     }
 
     // Click the visible Submit control, identified by its label and handler.
-    const b = submit.bounds;
-    const clicked = await safeCanvasPointerClickWorld(
-      b.x + b.width / 2, b.y + b.height / 2, '#4ade80', 250
-    );
+    let clicked = false;
+    if (submit) {
+      const b = submit.bounds;
+      clicked = await safeCanvasPointerClickWorld(
+        b.x + b.width / 2, b.y + b.height / 2, '#4ade80', 250
+      );
+    } else if (domSubmit) {
+      try {
+        domSubmit.click();
+        await sleep(250);
+        clicked = true;
+      } catch (_) {}
+    }
     if (!clicked) {
       setStatus('Exam: submit click failed');
       return;
@@ -10013,17 +10399,256 @@
     setStatus('Exam: submitted — waiting for next question');
   }
 
+  function examMultipleChoiceOptions() {
+    const a = state.pixiApp;
+    if (!a) return [];
+    const options = [];
+    walk(a.stage, o => {
+      if (!isVisible(o, a.stage)) return;
+      if (!verbEventNames(o).some(name => /^(?:pointerup|click|tap)$/i.test(name))) return;
+      const bounds = boundsOf(o);
+      if (!bounds || bounds.x < 480 || bounds.y < 180 || bounds.y > 500 ||
+          bounds.width < 180 || bounds.width > 460 ||
+          bounds.height < 30 || bounds.height > 100) return;
+      let hasAnswerBackground = false;
+      const labels = [];
+      walk(o, child => {
+        const texture = `${fullTextureName(child)} ${textureName(child)}`;
+        if (/questionBackgroundMultiChoiceBox/i.test(texture)) {
+          hasAnswerBackground = true;
+        }
+        if (typeof child.text === 'string' && child.text.trim() &&
+            isVisible(child, a.stage)) {
+          labels.push(child.text.trim());
+        }
+      });
+      // Some exam builds replace the image background after an answer. Keep
+      // accepting a text-bearing answer card when its geometry is still in
+      // the four-option answer area.
+      if (!hasAnswerBackground && labels.length === 0) return;
+      const label = labels
+        .filter(text => text.length > 1)
+        .sort((x, y) => y.length - x.length)[0];
+      if (label) options.push({label, bounds, obj: o});
+    });
+    const unique = new Map();
+    for (const option of options) {
+      const key = `${normaliseText(option.label)}|${Math.round(option.bounds.y)}`;
+      if (!unique.has(key)) unique.set(key, option);
+    }
+    return Array.from(unique.values()).sort((a, b) => a.bounds.y - b.bounds.y);
+  }
+
+  async function examMultipleChoiceTick() {
+    if (!state.examTranslations.length) {
+      setStatus('Exam MC: waiting for answers');
+      return;
+    }
+    const entry = examCurrentEntry();
+    if (!entry) {
+      setStatus('Exam MC: waiting for question');
+      return;
+    }
+    setPromptLabel(entry.question);
+    if (state.examSubmitted.has(entry.uid)) {
+      setStatus('Exam MC: answered — waiting for next question');
+      return;
+    }
+
+    const options = examMultipleChoiceOptions();
+    if (!options.length) {
+      setStatus('Exam MC: waiting for options');
+      return;
+    }
+    const wanted = normaliseText(entry.answer);
+    let matches = options.filter(option => normaliseText(option.label) === wanted);
+    if (!matches.length && wanted) {
+      matches = options.filter(option => {
+        const label = normaliseText(option.label);
+        return label.length > 2 && (label.includes(wanted) || wanted.includes(label));
+      });
+    }
+    if (!matches.length) {
+      const letter = entry.answer.trim().match(/^(?:option\s*)?([A-D])\)?$/i);
+      const number = entry.answer.trim().match(/^[1-4]$/);
+      const index = letter ? letter[1].toUpperCase().charCodeAt(0) - 65
+        : number ? Number(number[0]) - 1 : -1;
+      if (index >= 0 && index < options.length) matches = [options[index]];
+    }
+    if (matches.length !== 1) {
+      setStatus('Exam MC: exact answer option not found');
+      return;
+    }
+
+    const option = matches[0];
+    const b = option.bounds;
+    let clicked = option.obj && emitOnObject(option.obj, 'pointerup');
+    if (clicked) await sleep(250);
+    if (!clicked) {
+      clicked = await safeCanvasPointerClickWorld(
+        b.x + b.width / 2, b.y + b.height / 2, '#4ade80', 250
+      );
+    }
+    if (!clicked) {
+      setStatus('Exam MC: option click failed');
+      return;
+    }
+    state.examSubmitted.add(entry.uid);
+    state.answeredCount++;
+    setAnsweredCount(state.answeredCount);
+    addLog(`Exam MC answered question ${entry.uid}: ${option.label}`, 'ok');
+    setStatus('Exam MC: answered — waiting for next question');
+  }
+
+  function examTrueFalseOptions() {
+    const a = state.pixiApp;
+    if (!a) return [];
+    const options = [];
+    walk(a.stage, o => {
+      if (!isVisible(o, a.stage)) return;
+      if (!verbEventNames(o).some(name => /^(?:pointerup|click|tap)$/i.test(name))) return;
+      const children = o.children || [];
+      const icon = children.find(child =>
+        /(?:new_design\/game_display\/)?(?:true|false)Button/i.test(
+          `${fullTextureName(child)} ${textureName(child)}`
+        )
+      );
+      const texts = [];
+      walk(o, child => {
+        if (typeof child.text === 'string' && child.text.trim()) {
+          texts.push(child.text.trim());
+        }
+      });
+      const label = texts.find(text => /^(?:true|false)$/i.test(text));
+      if (!icon && !label) return;
+      const answer = icon
+        ? (/trueButton/i.test(`${fullTextureName(icon)} ${textureName(icon)}`) ? 'true' : 'false')
+        : label.toLowerCase();
+      const bounds = boundsOf(o);
+      if (bounds && bounds.width > 30 && bounds.height > 20) options.push({answer, bounds, obj: o});
+    });
+    return options;
+  }
+
+  async function examTrueFalseTick() {
+    if (!state.examTranslations.length) {
+      setStatus('Exam True / False: waiting for answers');
+      return;
+    }
+    const entry = examCurrentEntry();
+    if (!entry) {
+      setStatus('Exam True / False: waiting for question');
+      return;
+    }
+    setPromptLabel(entry.question);
+    if (state.examSubmitted.has(entry.uid)) {
+      setStatus('Exam True / False: answered — waiting for next question');
+      return;
+    }
+    const rawAnswer = normaliseText(entry.answer);
+    const answer = /^(?:true|t|1|yes)$/i.test(rawAnswer)
+      ? 'true'
+      : /^(?:false|f|0|no)$/i.test(rawAnswer)
+        ? 'false'
+        : '';
+    if (!answer) {
+      setStatus('Exam True / False: API answer missing');
+      return;
+    }
+    const matches = examTrueFalseOptions().filter(option => option.answer === answer);
+    if (matches.length !== 1) {
+      setStatus('Exam True / False: answer button not found');
+      return;
+    }
+    const b = matches[0].bounds;
+    // These exam buttons are CompositeGraphicsObject instances with a
+    // pointerup handler on the parent. Emit that handler first so the solver
+    // does not depend on canvas scaling or a transient tweened hitbox.
+    const control = matches[0].obj;
+    let clicked = control && emitOnObject(control, 'pointerup');
+    if (clicked) await sleep(250);
+    if (!clicked) {
+      clicked = await safeCanvasPointerClickWorld(
+        b.x + b.width / 2, b.y + b.height / 2, '#4ade80', 250
+      );
+    }
+    if (!clicked) {
+      setStatus('Exam True / False: click failed');
+      return;
+    }
+    state.examSubmitted.add(entry.uid);
+    state.answeredCount++;
+    setAnsweredCount(state.answeredCount);
+    addLog(`Exam True / False answered question ${entry.uid}: ${answer}`, 'ok');
+    setStatus('Exam True / False: answered — waiting for next question');
+  }
+
+  function examContinueControls() {
+    const a = state.pixiApp;
+    if (!a) return [];
+    const out = [];
+    walk(a.stage, obj => {
+      if (!isVisible(obj, a.stage)) return;
+      if (!verbEventNames(obj).some(name => /^(?:pointerup|click|tap)$/i.test(name))) return;
+      const labels = [];
+      walk(obj, child => {
+        if (typeof child.text === 'string' && child.text.trim()) labels.push(child.text.trim());
+      });
+      if (!labels.some(text => /^continue!?$/i.test(text))) return;
+      const bounds = boundsOf(obj);
+      if (bounds && bounds.width > 40 && bounds.height > 20) out.push({obj, bounds});
+    });
+    return out.sort((a, b) => a.bounds.y - b.bounds.y || a.bounds.x - b.bounds.x);
+  }
+
+  async function advanceExamAfterCompletion() {
+    if (state.examContinueBusy) return true;
+    const now = Date.now();
+    if (now - state.examContinueAt < 500) return true;
+    const controls = examContinueControls();
+    if (!controls.length) {
+      setStatus('Exam complete: waiting for Continue');
+      return true;
+    }
+    state.examContinueBusy = true;
+    state.examContinueAt = now;
+    const control = controls[0];
+    try {
+      let clicked = emitOnObject(control.obj, 'pointerup');
+      if (clicked) await sleep(350);
+      if (!clicked) {
+        const b = control.bounds;
+        clicked = await safeCanvasPointerClickWorld(
+          b.x + b.width / 2, b.y + b.height / 2, '#4ade80', 250
+        );
+      }
+      if (clicked) {
+        addLog(`Exam Continue clicked${controls.length > 1 ? ' — confirmation may follow' : ''}`, 'ok');
+        state.examSubmitted = new Set();
+        state.examGapOrder = [];
+        state.examGapIndex = 0;
+        state.examGapSubmitted = false;
+        state.completionSeen = null;
+      }
+    } finally {
+      state.examContinueBusy = false;
+    }
+    return true;
+  }
+
   // ============ MAIN ============
   async function tick() {
     if (!state.running) return;
     if (!tryGrabPixi()) { setStatus('Waiting for Pixi…'); return; }
     applyUserOptions();
+    hookServicesFakeTime();
 
     // Concert is exclusive. While its route is active, never let scene
     // heuristics reinterpret completion/result UI as another game.
-    const m = (isConcertRoute() || concertNavigationLocked())
+    const detectedMode = (isConcertRoute() || concertNavigationLocked())
       ? 'concert-speaking'
       : detectMode();
+    const m = detectedMode || state.mode;
 
     if (m === 'concert-speaking' || concertNavigationLocked()) {
       if (isConcertRoute()) concertEngageNavigationLock();
@@ -10038,14 +10663,14 @@
       }
     }
     if (m !== state.mode) {
+      state.fakeTimeAnswerBase = state.answeredCount;
       state.mode = m;
       setModeLabel(modeLabel(m));
       if (m) {
         addLog(`Activity: ${modeLabel(m)}`, 'ok');
         if (m === 'verb-matcher') addLog(`Verb Matcher delay: ${CONFIG.verbMatcherBetweenClicksMs}ms / ${CONFIG.verbMatcherAfterPairMs}ms`);
         if (m === 'jigsaw') addLog(
-          `Jigsaw delay: ${CONFIG.jigsawBetweenClicksMs}ms / ${CONFIG.jigsawAfterPairMs}ms; ` +
-          `animation speed forced to 1×`
+          `Jigsaw delay: ${CONFIG.jigsawBetweenClicksMs}ms / ${CONFIG.jigsawAfterPairMs}ms`
         );
         if (m === 'mc2-listening' || m === 'mc2-reading') addLog(
           `MC2 mode: ${m === 'mc2-listening' ? 'listening' : 'reading'}`
@@ -10056,8 +10681,17 @@
         if (m === 'skyrise') addLog(
           `Skyrise mode: DOM input`
         );
-        if (m === 'exam-open-reading') addLog(
-          `Exam Open Reading: exact question and submit controls`
+        if (m === 'exam-open-reading' || m === 'exam-open-listening' || m === 'exam-synonym') addLog(
+          `${modeLabel(m)}: exact API answer and submit controls`
+        );
+        if (m === 'exam-gapfill') addLog(
+          'Exam GapFill: ordered <removed> answers and word-bank controls'
+        );
+        if (m === 'exam-multiple-choice') addLog(
+          `Exam Multiple Choice: exact API answer and option controls`
+        );
+        if (m === 'exam-true-false') addLog(
+          `Exam True / False: API answer and button controls`
         );
         if (m === 'concert-speaking') addLog(
           `Concert Speaking: press Speak → TTS (${CONFIG.concertDefaultTargetLang})`
@@ -10082,6 +10716,10 @@
     }
     const done = detectCompletion();
     if (done) {
+      if (/^exam-/.test(String(m || ''))) {
+        await advanceExamAfterCompletion();
+        return;
+      }
       // Concert has stricter completion rules. Generic score/progress text
       // MUST NOT release the page lock while a real prompt+mic are visible.
       if (
@@ -10157,11 +10795,14 @@
       return;
     }
 
-    if (m === 'exam-open-reading') {
+    if (m === 'exam-gapfill' || m === 'exam-open-reading' || m === 'exam-open-listening' || m === 'exam-synonym' || m === 'exam-multiple-choice' || m === 'exam-true-false') {
       if (state.examBusy) return;
       state.examBusy = true;
       try {
-        await examOpenReadingTick();
+        if (m === 'exam-gapfill') await examGapfillTick();
+        else if (m === 'exam-multiple-choice') await examMultipleChoiceTick();
+        else if (m === 'exam-true-false') await examTrueFalseTick();
+        else await examOpenReadingTick();
       } catch (e) {
         addLog(`Exam runtime error: ${e && e.message ? e.message : e}`, 'err');
         setStatus('Exam: runtime error');
@@ -10312,7 +10953,7 @@
     const p = document.createElement('div');
     p.id = 'ln-ac-panel';
     p.innerHTML = `
-      <div id="ln-ac-header"><span>LN Autocompleter v10.9</span><button id="ln-ac-min">–</button></div>
+      <div id="ln-ac-header"><span>LN Autocompleter v11.6</span><button id="ln-ac-min">–</button></div>
       <div id="ln-ac-body">
         <div id="ln-ac-status">Idle</div>
         <div class="ln-ac-stat"><span>Mode</span><span id="ln-ac-mode">—</span></div>
@@ -10327,6 +10968,7 @@
           <label class="ln-ac-option"><input id="ln-ac-mute" type="checkbox"> Mute audio</label>
           <label class="ln-ac-option"><input id="ln-ac-fast" type="checkbox"> Fast animations</label>
         </div>
+        <label id="ln-ac-fake-row">Reported seconds/question <input id="ln-ac-fake-seconds" type="number" min="1" max="3600" step="1"></label>
         <div id="ln-ac-webhook-row">
           <input id="ln-ac-webhook" type="password" autocomplete="off" spellcheck="false" placeholder="Discord webhook URL (optional)">
           <button id="ln-ac-webhook-test" type="button">Test</button>
@@ -10355,6 +10997,8 @@
       #ln-ac-options{display:flex;gap:14px;align-items:center;margin:2px 0 10px;color:#999;font-size:10.5px}
       .ln-ac-option{display:flex;align-items:center;gap:5px;cursor:pointer;user-select:none}
       .ln-ac-option input{margin:0;accent-color:#4ade80}
+      #ln-ac-fake-row{display:flex;align-items:center;justify-content:space-between;margin:0 0 10px;color:#999;font-size:10.5px}
+      #ln-ac-fake-seconds{width:64px;padding:4px 6px;background:#111;border:1px solid #333;border-radius:6px;color:#ddd;font:11px ui-monospace,Menlo,monospace}
       #ln-ac-webhook-row{display:flex;gap:6px;margin:0 0 10px}
       #ln-ac-webhook{min-width:0;flex:1;background:#111;border:1px solid #333;border-radius:6px;color:#ddd;padding:7px 8px;font:10px ui-monospace,Menlo,monospace;outline:none}
       #ln-ac-webhook:focus{border-color:#555}
@@ -10374,8 +11018,21 @@
 
     const muteBox = document.getElementById('ln-ac-mute');
     const fastBox = document.getElementById('ln-ac-fast');
+    const fakeSecondsBox = document.getElementById('ln-ac-fake-seconds');
     const webhookBox = document.getElementById('ln-ac-webhook');
     const webhookTest = document.getElementById('ln-ac-webhook-test');
+
+    if (fakeSecondsBox) {
+      fakeSecondsBox.value = String(state.fakeTimeSeconds);
+      fakeSecondsBox.addEventListener('change', () => {
+        const value = Math.round(Number(fakeSecondsBox.value));
+        state.fakeTimeSeconds = Number.isFinite(value)
+          ? Math.max(1, Math.min(3600, value)) : 30;
+        fakeSecondsBox.value = String(state.fakeTimeSeconds);
+        saveStringSetting('fakeTimeSeconds', state.fakeTimeSeconds);
+        addLog(`Reported time: ${state.fakeTimeSeconds}s per question`, 'ok');
+      });
+    }
 
     if (webhookBox) {
       webhookBox.value = state.discordWebhook || '';
@@ -10460,7 +11117,8 @@
       else if (state.mode === 'wordpod-listening' || state.mode === 'wordpod-reading') { resetWordPodState(); addLog('↺'); }
       else if (state.mode === 'skyrise') { resetSkyRiseState(); addLog('↺'); }
       else if (state.mode === 'concert-speaking') { resetConcertState(); addLog('↺'); }
-      else if (state.mode === 'exam-open-reading') { state.examSubmitted = new Set(); addLog('↺'); }
+      else if (state.mode === 'exam-gapfill') { state.examGapOrder = []; state.examGapIndex = 0; state.examGapSubmitted = false; addLog('↺'); }
+      else if (state.mode === 'exam-open-reading' || state.mode === 'exam-open-listening' || state.mode === 'exam-synonym' || state.mode === 'exam-multiple-choice' || state.mode === 'exam-true-false') { state.examSubmitted = new Set(); addLog('↺'); }
       else if (state.mode === 'mc2-listening' || state.mode === 'mc2-reading') { resetMC2State(); addLog('↺'); }
       else { state.currentAnswer = null; state.currentEntry = null; state.currentPrompt = null; state.lastAudioUrl = null; state.lastAnsweredKey = null; setAudioLabel(''); setPromptLabel(''); addLog('↺'); }
     });
@@ -10523,7 +11181,7 @@
   }
   function updateModeButtons(m) {
     const pl = document.getElementById('ln-ac-play'); if (pl) pl.style.display = (m === 'mc-listening' || m === 'mc2-listening' || m === 'wordpod-listening' || m === 'wordpop-listening') ? '' : 'none';
-    const ps = document.getElementById('ln-ac-prompt'); if (ps) { const r = ps.closest('.ln-ac-stat'); if (r) r.style.display = (m === 'exam-open-reading' || m === 'mc-reading' || m === 'mc2-reading' || m === 'wordpod-reading' || m === 'wordpod-listening' || m === 'skyrise' || m === 'concert-speaking' || m === 'fridge' || m === 'verb-matcher' || m === 'jigsaw' || m === 'forklift' || m === 'ocean-cleaner' || m === 'gapfill') ? '' : 'none'; }
+    const ps = document.getElementById('ln-ac-prompt'); if (ps) { const r = ps.closest('.ln-ac-stat'); if (r) r.style.display = (m === 'exam-gapfill' || m === 'exam-synonym' || m === 'exam-open-listening' || m === 'exam-true-false' || m === 'exam-multiple-choice' || m === 'exam-open-reading' || m === 'mc-reading' || m === 'mc2-reading' || m === 'wordpod-reading' || m === 'wordpod-listening' || m === 'skyrise' || m === 'concert-speaking' || m === 'fridge' || m === 'verb-matcher' || m === 'jigsaw' || m === 'forklift' || m === 'ocean-cleaner' || m === 'gapfill') ? '' : 'none'; }
     const as = document.getElementById('ln-ac-audio'); if (as) { const r = as.closest('.ln-ac-stat'); if (r) r.style.display = (m === 'mc-listening' || m === 'mc2-listening' || m === 'wordpod-listening' || m === 'wordpop-listening') ? '' : 'none'; }
     const ts = document.getElementById('ln-ac-target'); if (ts) { const r = ts.closest('.ln-ac-stat'); if (r) r.style.display = (m === 'jumble') ? '' : 'none'; }
     const ss = document.getElementById('ln-ac-seq'); if (ss) { const r = ss.closest('.ln-ac-stat'); if (r) r.style.display = (m === 'jumble') ? '' : 'none'; }
@@ -10557,6 +11215,8 @@
     const b = document.getElementById('ln-ac-toggle');
 
     if (state.running) {
+      state.fakeTimeAnswerBase = state.answeredCount;
+      hookServicesFakeTime();
       state.completionSeen = null;
       state.concertCompleted = false;
       state.concertHadQuestion = false;
