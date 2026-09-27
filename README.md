@@ -1,4 +1,4 @@
-Lume: A Free Languagenut Autocompleter,
+Lume: A Free Languagenut Autocompleter.
 A Tampermonkey script that automates homework.
 
 It does not use any ai to fetch the answer, it relies on api calls,
