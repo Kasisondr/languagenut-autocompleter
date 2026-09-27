@@ -39,4 +39,4 @@ How the script gets the answers without AI:
    getVocabTranslations, getSentenceTranslations, and getVerbTranslations so the script reads the output from the script and thats is what the answer usually comes from.
 
 There is an exploit that I made that changes the api calls for the Concert Speaking Game to make the answers correct, you paste this into dev tools and press the mic button to "speak", it is found inside of concert.js
-It shows as 15/15 (or whatever value it is)
+It shows as 15/15 (or whatever it is)
