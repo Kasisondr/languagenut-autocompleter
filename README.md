@@ -7,7 +7,11 @@ It does not use any AI to fetch answers—it relies directly on API calls. This 
 ---
 
 ## Features
+* Automation
+* Fake Time
+* Webhook Support
 
+## Supported Games
 * Jumble
 * Multiple Choice Listening
 * Multiple Choice Reading
