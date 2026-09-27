@@ -31,17 +31,17 @@ It does not use any AI to fetch answers—it relies directly on API calls. This 
 * Blast Off (I think)
 * Matching Pairs
 * Exams
-
+* Dictation
+* Naughts and Crosses
+* Memory Game
+* Racing
 ---
 
 ## Working On
 
-* Phonics Band
-* Guacamole
 * Phonics Imposter
 * Phonics Catapult
-* Racing
-* *More to come...*
+* Other Stuff
 
 ---
 
@@ -65,4 +65,4 @@ There is an exploit implemented in `concert.js` that alters the API calls for th
 **How to use it:**
 1. Paste the exploit code from `concert.js` into your browser's Developer Tools console.
 2. Press the microphone button to "speak."
-3. The interface will instantly show a completed score (e.g., 15/15).
+3. The interface will instantly show a completed score (e.g., 15/15). (Note: we dont use this exploit in the autocompleter, it might be detected or not idk)
