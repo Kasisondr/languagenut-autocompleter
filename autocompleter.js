@@ -1,9 +1,9 @@
 // ==UserScript==
-// @name         LanguageNut Autocompleter (Jumble + MC + Fridge)
+// @name         Lume - Languagenut
 // @namespace    languagenut-autocompleter
-// @version      12.13
+// @version      12.26
 // @description  Autocompletes LanguageNut vocab/sentence activities including WordPod, Skyrise and Concert Speaking
-// @author       You
+// @author       kas
 // @match        *://*.languagenut.com/*
 // @match        *://languagenut.com/*
 // @grant        none
@@ -48,9 +48,6 @@
     gapAfterSubmitMs: 700,
     gapMaxFails: 8,
 
-    // Bound tween speed so fast mode cannot starve the input/game loop.
-    // Pixi's simulation ticker stays at 1×; CSS and solver waits are short.
-    fastAnimationSpeed: 4,
 
     mc2AfterPlayMs: 350,
     mc2AfterClickMs: 180,
@@ -117,12 +114,24 @@
     gapAnswer: '', gapSubmittedKey: null, gapSubmittedAt: 0,
     gapTransitionSeen: false, gapRoundSerial: 0, gapFails: 0,
     gapBusy: false, gapLastInference: null,
-    muteAudio: false, fastAnimations: false,
+    muteAudio: false,
     mc2Busy: false, mc2LastKey: null, mc2Fails: 0, mc2LastSignature: null,
-    wordPodBusy: false, wordPodLastSignature: null, wordPodCandidates: [],
+    mc2ReadingPending: null, mc2ReadingRejectedSignature: '',
+    mc2PendingKey: null, mc2PendingSignature: '', mc2PendingAudio: '',
+    mc2PendingLabel: '', mc2PendingCorrect: 0, mc2PendingIncorrect: 0,
+    mc2PendingSince: 0, mc2PendingClicks: 0, mc2ListeningAnsweredKeys: new Set(),
+    mc2QuestionChangeAt: 0, mc2AnsweredQuestionSignature: '',
+    mc2RejectedQuestionSignature: '', mc2RetryQuestionSignature: '',
+    mc2RetryCount: 0, mc2RetryAfter: 0,
+    mc2AudioCaptureSignature: '', mc2AudioCaptureUntil: 0,
+    mc2AudioCaptureBusy: false, mc2CapturedAudioSignature: '',
+      wordPodBusy: false, wordPodLastSignature: null, wordPodCandidates: [],
     wordPodCandidateIndex: 0, wordPodTypedLast: '', wordPodFails: 0,
     wordPodSubmittedKey: null, wordPodLockedQuestion: null,
+    wordPodLastUnresolvedKey: '',
+    wordPodInputNode: null, wordPodQuestionEpoch: 0, wordPodLastPlayAt: 0,
     skyRiseBusy: false, skyRiseLastQuestion: null, skyRiseLockedQuestion: null,
+    skyRiseCurrentItem: null, skyRiseQuestionEpoch: 0,
     skyRiseFails: 0,
     concertBusy: false, concertLockedQuestion: null, concertLastPrompt: null,
     concertLastSpoken: '', concertFails: 0, concertSpeakButtonCache: null,
@@ -154,11 +163,29 @@
     zenNoughtsBusy: false, zenNoughtsLastCount: 0, zenNoughtsNextMoveAt: 0,
     raceBusy: false, raceLastQuestion: '', raceLastChunks: 0,
     raceRightHeld: false, raceBoostTarget: null, raceBoostAssertAt: 0,
+    raceMissLogKey: '',
+    autopilot: false, pilotHomeworkUid: '', pilotTaskIndex: 0,
+    pilotAssignmentUid: '', pilotTaskIndexUid: '', pilotTaskText: '', pilotGameName: '',
+    pilotAwaitingGame: false, pilotInGame: false, pilotRouteStep: '',
+    pilotRouteAttempts: 0, pilotLastActionAt: 0, pilotBlockedStep: '',
+    pilotCompletedHomeworkIds: new Set(), pilotFinished: false,
+    pilotCompletionSignal: '', pilotCompletionAt: 0, pilotContinueAt: 0,
+    pilotCatalogTabIndex: 0, pilotCatalogTabAt: 0, pilotCatalogQuizSelected: false,
+    pilotFinishingTask: false,
+    pilotDoingPrerequisite: false, pilotCatalogHash: '',
+    pilotStartedAt: 0, pilotElapsedMs: 0, pilotFakeSeconds: 0,
+    pilotErrorCounts: new Map(), humanize: false,
+    errorLastLogAt: new Map(),
+    uiAccent: '#4ade80', uiScale: 100, uiOpacity: 96,
+    uiDock: 'bottom-right',
     dictationBusy: false, dictationSubmitted: false,
     dictationSawHidden: false, dictationLastAudio: '', dictationPlayAt: 0,
     discordWebhook: '', webhookLastAnswered: 0, webhookSending: false,
     wordPopFails: 0, wordPopLastKey: null, wordPopBusy: false,
     wordPopAudioBusy: false, wordPopLastSignature: null,
+    wordPopTranslationTriedKey: '', wordPopTranslationTerms: [],
+    wordPopControllerItem: null, wordPopControllerQuestion: null,
+    wordPopNextPlayAt: 0,
     completionSeen: null, panelInjected: false, _lastFridgeErr: null
   };
 
@@ -194,7 +221,33 @@
   }
 
   state.muteAudio = loadBoolSetting('muteAudio', false);
-  state.fastAnimations = loadBoolSetting('fastAnimations', false);
+  state.autopilot = loadBoolSetting('autopilot', false);
+  state.humanize = loadBoolSetting('humanize', false);
+  state.uiAccent = loadStringSetting('uiAccent', '#4ade80');
+  state.uiScale = Math.max(75, Math.min(130, Number(loadStringSetting('uiScale', '100')) || 100));
+  state.uiOpacity = Math.max(70, Math.min(100, Number(loadStringSetting('uiOpacity', '96')) || 96));
+  state.uiDock = loadStringSetting('uiDock', 'bottom-right');
+  state.pilotElapsedMs = Math.max(0, Number(loadStringSetting('pilotElapsedMs', '0')) || 0);
+  state.pilotFakeSeconds = Math.max(0, Number(loadStringSetting('pilotFakeSeconds', '0')) || 0);
+  state.pilotHomeworkUid = loadStringSetting('pilotHomeworkUid', '');
+  state.pilotTaskIndex = Math.max(0, parseInt(loadStringSetting('pilotTaskIndex', '0'), 10) || 0);
+  state.pilotAssignmentUid = loadStringSetting('pilotAssignmentUid', '');
+  state.pilotTaskIndexUid = loadStringSetting('pilotTaskIndexUid', '');
+  state.pilotTaskText = loadStringSetting('pilotTaskText', '');
+  state.pilotGameName = loadStringSetting('pilotGameName', '');
+  state.pilotAwaitingGame = loadBoolSetting('pilotAwaitingGame', false);
+  state.pilotInGame = loadBoolSetting('pilotInGame', false);
+  state.pilotFinished = loadBoolSetting('pilotFinished', false);
+  state.pilotFinishingTask = loadBoolSetting('pilotFinishingTask', false);
+  state.pilotDoingPrerequisite = loadBoolSetting('pilotDoingPrerequisite', false);
+  state.pilotCatalogHash = loadStringSetting('pilotCatalogHash', '');
+  state.pilotCompletionSignal = loadStringSetting('pilotCompletionSignal', '');
+  state.pilotCompletionAt = Number(loadStringSetting('pilotCompletionAt', '0')) || 0;
+  state.pilotContinueAt = Number(loadStringSetting('pilotContinueAt', '0')) || 0;
+  try {
+    const completed = JSON.parse(loadStringSetting('pilotCompletedHomeworkIds', '[]'));
+    if (Array.isArray(completed)) state.pilotCompletedHomeworkIds = new Set(completed.map(String));
+  } catch (_) {}
   state.discordWebhook = loadStringSetting('discordWebhook', '');
   state.fakeTimeMin = Math.max(1, Math.min(3600,
     Number(loadStringSetting('fakeTimeMin', '20')) || 20));
@@ -222,11 +275,50 @@
     return total * 1000;
   }
 
+  function fakeTimeQuestionCount() {
+    return Math.max(0, state.answeredCount - state.fakeTimeAnswerBase);
+  }
+
+  function formatDuration(seconds) {
+    const s = Math.max(0, Math.floor(seconds || 0));
+    return `${Math.floor(s / 3600)}h ${String(Math.floor(s / 60) % 60).padStart(2, '0')}m ${String(s % 60).padStart(2, '0')}s`;
+  }
+
+  function pilotElapsedSeconds() {
+    return Math.round((state.pilotElapsedMs + (state.pilotStartedAt ? Date.now() - state.pilotStartedAt : 0)) / 1000);
+  }
+
+  function refreshPilotTimer() {
+    const real = document.getElementById('ln-ac-real-time');
+    const simulated = document.getElementById('ln-ac-simulated-time');
+    if (real) real.textContent = formatDuration(pilotElapsedSeconds());
+    if (simulated) simulated.textContent = formatDuration(state.pilotFakeSeconds);
+  }
+
+  function humanizeLongAnswer(value) {
+    const text = String(value || '');
+    if (!state.humanize || text.trim().split(/\s+/).length < 6) return text;
+    // Keep the words intact. Optional punctuation omissions are limited to
+    // free-text responses; short exact-match answers retain their syntax.
+    return text.replace(/[,.;!?]/g, mark => Math.random() < 0.18 ? '' : mark);
+  }
+
+  function markAnswerConfirmed(detail, uniqueKey) {
+    if (uniqueKey && state.mc2ListeningAnsweredKeys.has(uniqueKey)) return false;
+    if (uniqueKey) state.mc2ListeningAnsweredKeys.add(uniqueKey);
+    const nextCount = fakeTimeQuestionCount() + 1;
+    state.answeredCount++;
+    setAnsweredCount(state.answeredCount);
+    addLog(`Question ${nextCount} confirmed${detail ? ` (${detail})` : ''}`, 'ok');
+    return nextCount;
+  }
+
   function resetFakeTimeActivity() {
     state.fakeTimeAnswerBase = state.answeredCount;
     state.fakeTimeSamples = [];
     state.fakeTimeLoggedCount = 0;
     state.fakeTimeCompletionLogged = false;
+    state.mc2ListeningAnsweredKeys = new Set();
   }
 
   function logFakeTimeCompletion() {
@@ -357,84 +449,10 @@
     } catch (_) {}
   }
 
-  function applyAnimationSpeed() {
-    // Keep game simulation responsive while shortening tweens and waits.
-    const speed = state.fastAnimations ? CONFIG.fastAnimationSpeed : 1;
-
-    try {
-      if (
-        state.pixiApp &&
-        state.pixiApp.ticker &&
-        typeof state.pixiApp.ticker.speed === 'number'
-      ) {
-        // A 100× Pixi ticker can make game loops run thousands of updates per
-        // frame and starve input. Keep simulation time real; speed up tweens.
-        state.pixiApp.ticker.speed = 1;
-      }
-    } catch (_) {}
-
-    // Common tween libraries used by browser games. Only touch them when they
-    // already exist on the page.
-    try {
-      if (
-        window.gsap &&
-        window.gsap.globalTimeline &&
-        typeof window.gsap.globalTimeline.timeScale === 'function'
-      ) {
-        if (window.gsap.globalTimeline.timeScale() !== speed)
-          window.gsap.globalTimeline.timeScale(speed);
-      }
-    } catch (_) {}
-
-    try {
-      if (
-        window.TweenMax &&
-        typeof window.TweenMax.globalTimeScale === 'function'
-      ) {
-        if (window.TweenMax.globalTimeScale() !== speed)
-          window.TweenMax.globalTimeScale(speed);
-      }
-    } catch (_) {}
-
-    try {
-      if (
-        window.TweenLite &&
-        typeof window.TweenLite.globalTimeScale === 'function'
-      ) {
-        if (window.TweenLite.globalTimeScale() !== speed)
-          window.TweenLite.globalTimeScale(speed);
-      }
-    } catch (_) {}
-
-    // LanguageNut uses a mixture of Pixi tweens and ordinary DOM CSS
-    // transitions.  A Pixi time scale cannot affect the latter, so maintain a
-    // small page style that disables them while Fast animations is enabled.
-    try {
-      let style = document.getElementById('ln-ac-instant-animations');
-      if (state.fastAnimations) {
-        if (!style) {
-          style = document.createElement('style');
-          style.id = 'ln-ac-instant-animations';
-          (document.head || document.documentElement).appendChild(style);
-        }
-        const css =
-          '*,*::before,*::after{' +
-          'animation-duration:0.01s!important;' +
-          'animation-delay:0s!important;' +
-          'transition-duration:0.01s!important;' +
-          'transition-delay:0s!important;' +
-          'scroll-behavior:auto!important;' +
-          '}';
-        if (style.textContent !== css) style.textContent = css;
-      } else if (style) {
-        style.remove();
-      }
-    } catch (_) {}
-  }
-
   function applyUserOptions() {
     applyAudioMute();
-    applyAnimationSpeed();
+    const autoBox = document.getElementById('ln-ac-auto');
+    if (autoBox && autoBox.checked !== !!state.autopilot) autoBox.checked = !!state.autopilot;
   }
 
   // ============ DATA HOOKS ============
@@ -834,13 +852,61 @@
 
     return null;
   }
-  function recordAudio(url) { if (!url) return; state.lastAudioUrl = String(url); if ((state.mode !== 'mc-listening' && state.mode !== 'mc2-listening' && state.mode !== 'wordpod-listening' && state.mode !== 'wordpop-listening') || (state.vocab.length === 0 && state.sentences.length === 0)) return;
-    const e = matchAudioToEntry(url); if (!e) return; state.currentEntry = e;
-    const word = String(e.word || e.sentence || e.originalSentence || '').trim();
-    const orig = String(e.originalWord || e.translation || e.translatedSentence || '').trim();
-    state.currentAnswer = { word, originalWord: orig };
-    addLog(`Audio → "${state.currentAnswer.word}" / "${state.currentAnswer.originalWord}"`, 'ok');
-    setAudioLabel(`${state.currentAnswer.word} ⟷ ${state.currentAnswer.originalWord}`); }
+  function recordAudio(url) {
+    if (!url) return;
+    const audioUrl = String(url);
+
+    // MC2 Listening accepts audio identity only when its own question audio
+    // control was just clicked. Ignore stale music, answer-card speakers and
+    // audio from a previous question.
+    if (state.mode === 'mc2-listening') {
+      const questionSig = state.mc2AudioCaptureSignature;
+      if (!questionSig || Date.now() > state.mc2AudioCaptureUntil ||
+          questionSig !== mc2QuestionSignature()) return;
+      const entry = matchAudioToEntry(audioUrl);
+      if (!entry) return;
+      state.lastAudioUrl = audioUrl;
+      state.currentEntry = entry;
+      state.currentAnswer = {
+        word: String(entry.word || entry.sentence || entry.originalSentence || '').trim(),
+        originalWord: String(entry.originalWord || entry.translation || entry.translatedSentence || '').trim()
+      };
+      state.mc2CapturedAudioSignature = questionSig;
+      state.mc2AudioCaptureSignature = '';
+      state.mc2AudioCaptureUntil = 0;
+      addLog(`MC2 audio → "${state.currentAnswer.word}" / "${state.currentAnswer.originalWord}"`, 'ok');
+      setAudioLabel(`${state.currentAnswer.word} ⟷ ${state.currentAnswer.originalWord}`);
+      return;
+    }
+
+    if (state.mode === 'wordpod-listening') {
+      const entry = matchAudioToEntry(audioUrl);
+      // WordPod plays correct/wrong effects during feedback. Those URLs must
+      // not replace the current question's vocabulary audio identity.
+      if (!entry) return;
+      state.lastAudioUrl = audioUrl;
+      state.currentEntry = entry;
+      state.currentAnswer = {
+        word: String(entry.word || '').trim(),
+        originalWord: String(entry.originalWord || '').trim()
+      };
+      setAudioLabel(`${state.currentAnswer.word} ⟷ ${state.currentAnswer.originalWord}`);
+      return;
+    }
+
+    state.lastAudioUrl = audioUrl;
+    if ((state.mode !== 'mc-listening' && state.mode !== 'wordpod-listening' &&
+         state.mode !== 'wordpop-listening') ||
+        (state.vocab.length === 0 && state.sentences.length === 0)) return;
+    const entry = matchAudioToEntry(audioUrl);
+    if (!entry) return;
+    state.currentEntry = entry;
+    const word = String(entry.word || entry.sentence || entry.originalSentence || '').trim();
+    const originalWord = String(entry.originalWord || entry.translation || entry.translatedSentence || '').trim();
+    state.currentAnswer = { word, originalWord };
+    addLog(`Audio → "${word}" / "${originalWord}"`, 'ok');
+    setAudioLabel(`${word} ⟷ ${originalWord}`);
+  }
   (function () {
     const o = HTMLMediaElement.prototype.play;
     if (!o) return;
@@ -887,20 +953,18 @@
   function isPixiApp(o) { return o && typeof o === 'object' && o.stage && o.renderer && o.ticker && o.view; }
   function tryGrabPixi() {
     if (isPixiApp(state.pixiApp)) {
-      applyAnimationSpeed();
       return true;
     }
 
     if (isPixiApp(window.__PIXI_APP__)) {
       state.pixiApp = window.__PIXI_APP__;
-      applyAnimationSpeed();
       addLog('Pixi hooked', 'ok');
       return true;
     }
 
     return false;
   }
-  (function () { let _p; try { Object.defineProperty(window, '__PIXI_APP__', { configurable: true, get() { return _p; }, set(v) { _p = v; if (isPixiApp(v)) { state.pixiApp = v; applyAnimationSpeed(); addLog('Pixi hooked', 'ok'); } } }); } catch (_) {} })();
+  (function () { let _p; try { Object.defineProperty(window, '__PIXI_APP__', { configurable: true, get() { return _p; }, set(v) { _p = v; if (isPixiApp(v)) { state.pixiApp = v; addLog('Pixi hooked', 'ok'); } } }); } catch (_) {} })();
 
   // ============ SCENE ============
   function walk(c, fn, d) { d = d || 0; if (!c || d > 30) return; try { fn(c); } catch (_) {} const k = c.children; if (k && k.length) for (let i = 0; i < k.length; i++) walk(k[i], fn, d + 1); }
@@ -1068,7 +1132,7 @@
       if (state.pixiApp && state.pixiApp.stage) {
         emitOnObject(state.pixiApp.stage, 'pointermove', curWorld);
       }
-      await new Promise(r => setTimeout(r, state.fastAnimations ? 4 : 15));
+      await new Promise(r => setTimeout(r, 15));
     }
     await sleep(35);
 
@@ -1091,7 +1155,7 @@
 
   const sleep = ms => {
     // Always leave a small event-loop gap so input handlers can finish.
-    const delay = state.fastAnimations ? Math.min(30, Math.max(8, (Number(ms) || 0) / 10)) : Number(ms) || 0;
+    const delay = Number(ms) || 0;
     return delay > 0 ? new Promise(r => setTimeout(r, delay)) : Promise.resolve();
   };
 
@@ -2119,64 +2183,87 @@
     return out;
   }
 
-  function mc2FindAudioButton() {
-    const a = state.pixiApp;
-    if (!a) return null;
-
+  function mc2FindAudioButton(scene) {
+    const app = state.pixiApp;
+    if (!app) return null;
+    const currentScene = scene || mc2Scene();
     const found = [];
+    const seenIcons = new Set();
 
-    walk(a.stage, (o) => {
-      if (!isVisible(o, a.stage)) return;
+    walk(app.stage, o => {
+      if (!isVisible(o, app.stage)) return;
+      const texture = fullTextureName(o);
+      if (!/new\/multipleChoice\/SoundButton/i.test(texture) &&
+          !/new\/multipleChoice\/SoundIcon/i.test(texture) &&
+          !/new_design\/AudioButton/i.test(texture) &&
+          !/audioWordPod/i.test(texture)) return;
 
-      const f = fullTextureName(o);
+      const iconBounds = boundsOf(o);
+      if (!iconBounds || iconBounds.width < 12 || iconBounds.height < 12 ||
+          iconBounds.width > 280 || iconBounds.height > 160) return;
 
-      if (
-        !/new\/multipleChoice\/SoundButton/i.test(f) &&
-        !/new\/multipleChoice\/SoundIcon/i.test(f) &&
-        !/new_design\/AudioButton/i.test(f) &&
-        !/audioWordPod/i.test(f)
-      ) return;
-
-      const b = boundsOf(o);
-      if (!b || b.width < 15 || b.height < 15 || b.width > 280 || b.height > 160) return;
-
-      let p = o;
-      let depth = 0;
-      let clickObj = o;
-      let clickBounds = b;
+      let target = o;
+      let targetBounds = iconBounds;
       let events = [];
-
-      while (p && depth < 6) {
-        const pb = boundsOf(p);
-        if (!pb || pb.width > 320 || pb.height > 190) break;
-
-        const pe = verbEventNames(p);
-
-        if (pe.some(e => /^(pointerup|click|tap|mouseup|touchend)$/i.test(e))) {
-          clickObj = p;
-          clickBounds = pb;
-          events = pe;
+      let parent = o;
+      for (let depth = 0; parent && depth < 6; depth++) {
+        const bounds = boundsOf(parent);
+        if (!bounds || bounds.width > 320 || bounds.height > 190) break;
+        const listeners = verbEventNames(parent);
+        if (listeners.some(name => /^(pointerup|click|tap|mouseup|touchend)$/i.test(name))) {
+          target = parent;
+          targetBounds = bounds;
+          events = listeners;
           break;
         }
-
-        p = p.parent;
-        depth++;
+        parent = parent.parent;
       }
 
+      // MC2 answer cards can each contain their own speaker icon. Never use
+      // one of those as the question prompt audio control.
+      const isAnswerSpeaker = currentScene.options.some(option => {
+        const b = option.bounds;
+        if (!b) return false;
+        const overlapX = Math.max(0, Math.min(targetBounds.x + targetBounds.width, b.x + b.width) -
+          Math.max(targetBounds.x, b.x));
+        const overlapY = Math.max(0, Math.min(targetBounds.y + targetBounds.height, b.y + b.height) -
+          Math.max(targetBounds.y, b.y));
+        const overlapArea = overlapX * overlapY;
+        const smallerArea = Math.min(targetBounds.width * targetBounds.height, b.width * b.height);
+        const cx = iconBounds.x + iconBounds.width / 2;
+        const cy = iconBounds.y + iconBounds.height / 2;
+        return (smallerArea > 0 && overlapArea / smallerArea >= 0.15) ||
+          (cx >= b.x - 3 && cx <= b.x + b.width + 3 &&
+           cy >= b.y - 3 && cy <= b.y + b.height + 3);
+      });
+      if (isAnswerSpeaker || seenIcons.has(o)) return;
+      seenIcons.add(o);
+
+      const area = targetBounds.width * targetBounds.height;
+      const priority = /new\/multipleChoice\/SoundButton/i.test(texture) ? 0 :
+        /new_design\/AudioButton/i.test(texture) ? 1 :
+        /audioWordPod/i.test(texture) ? 2 : 3;
       found.push({
-        obj: clickObj,
-        bounds: clickBounds,
-        texture: f,
+        obj: target,
+        bounds: iconBounds,
+        clickBounds: targetBounds,
+        texture,
         events,
-        area: clickBounds.width * clickBounds.height
+        area,
+        priority
       });
     });
 
+    found.sort((a, b) => a.priority - b.priority || a.area - b.area || a.bounds.y - b.bounds.y);
     if (!found.length) return null;
-
-    // Prefer the smallest real audio control, not a large wrapping card.
-    found.sort((a, b) => a.area - b.area);
-    return found[0];
+    // ZenMultipleChoice renders its question speaker as new_design/AudioButton,
+    // while its answer speakers use new/multipleChoice/SoundIcon. The old
+    // SoundButton-only return filter discarded the Zen prompt entirely.
+    const questionAudio = found.filter(audio =>
+      /new_design\/AudioButton/i.test(audio.texture) ||
+      /new\/multipleChoice\/SoundButton/i.test(audio.texture)
+    );
+    return questionAudio.length === 1 ? questionAudio[0] : null;
   }
 
   function mc2Scene() {
@@ -2244,14 +2331,284 @@
   }
 
   function mc2Signature() {
-    const s = mc2Scene();
-
-    return s.options
-      .map(o =>
-        `${o.norm}@${Math.round(o.textBounds.x)}:${Math.round(o.textBounds.y)}`
-      )
+    const scene = mc2Scene();
+    return scene.options
+      .map(option => `${option.norm}@${Math.round(option.textBounds.x)}:${Math.round(option.textBounds.y)}`)
       .sort()
       .join('|');
+  }
+
+  function mc2QuestionSignature(scene) {
+    const currentScene = scene || mc2Scene();
+    const prompt = currentScene.prompt ? currentScene.prompt.norm : '';
+    const options = currentScene.options.map(option => option.norm).sort().join('|');
+    return `${prompt}::${options}`;
+  }
+
+  function mc2ClearListeningAnswer() {
+    state.currentAnswer = null;
+    state.currentEntry = null;
+    state.lastAudioUrl = null;
+    state.mc2CapturedAudioSignature = '';
+    state.mc2AudioCaptureSignature = '';
+    state.mc2AudioCaptureUntil = 0;
+    setAudioLabel('');
+  }
+
+  function mc2ConfirmListeningAnswer(detail, questionAdvanced) {
+    const key = state.mc2PendingKey;
+    const answeredSignature = state.mc2PendingSignature;
+    const label = state.mc2PendingLabel;
+    if (!key) return false;
+
+    markAnswerConfirmed(`MC2 Listening: ${label}${detail ? ` — ${detail}` : ''}`, key);
+    state.mc2AnsweredQuestionSignature = answeredSignature;
+    mc2ClearPendingListening();
+    mc2ClearListeningAnswer();
+    if (questionAdvanced) {
+      state.mc2LastKey = null;
+      state.lastPlayedKey = null;
+    } else {
+      // A positive-result marker can appear before the next options load. Lock
+      // this question so it cannot be clicked or timed a second time.
+      state.lastPlayedKey = `mc2:${answeredSignature}`;
+    }
+    return true;
+  }
+
+  function mc2RejectListeningAnswer() {
+    const signature = state.mc2PendingSignature;
+    const label = state.mc2PendingLabel;
+    if (state.mc2RetryQuestionSignature !== signature) {
+      state.mc2RetryQuestionSignature = signature;
+      state.mc2RetryCount = 0;
+    }
+    state.mc2RetryCount++;
+    const retriesUsed = state.mc2RetryCount;
+    mc2ClearPendingListening();
+    mc2ClearListeningAnswer();
+    state.mc2LastKey = null;
+    state.mc2RetryAfter = Date.now() + 850;
+
+    if (retriesUsed < 2) {
+      state.lastPlayedKey = null;
+      addLog(`MC2 rejected "${label}"; allowing one controlled audio retry`, 'err');
+      setStatus('MC2 Listening: answer rejected — retrying once after audio refresh');
+    } else {
+      state.mc2RejectedQuestionSignature = signature;
+      state.lastPlayedKey = `mc2:${signature}`;
+      setStatus('MC2 Listening: rejected twice — paused on this question to prevent repeat clicks');
+    }
+  }
+
+  async function mc2PlayListeningAudio() {
+    if (state.mc2AudioCaptureBusy || state.mc2PendingKey) return false;
+    const scene = mc2Scene();
+    const signature = mc2QuestionSignature(scene);
+    if (!scene.options.length || state.mc2AnsweredQuestionSignature === signature ||
+        state.mc2RejectedQuestionSignature === signature) return false;
+
+    const audio = mc2FindAudioButton(scene);
+    if (!audio) {
+      setStatus('MC2 Listening: no standalone question audio button found');
+      return false;
+    }
+
+    const b = audio.bounds;
+    const point = {x: b.x + b.width / 2, y: b.y + b.height / 2};
+    state.lastPlayedKey = `mc2:${signature}`;
+    state.lastMC2PlayAttemptAt = Date.now();
+    state.mc2AudioCaptureBusy = true;
+    state.mc2AudioCaptureSignature = signature;
+    state.mc2AudioCaptureUntil = Date.now() + 3500;
+    state.mc2CapturedAudioSignature = '';
+    state.currentAnswer = null;
+    state.currentEntry = null;
+    state.lastAudioUrl = null;
+    setAudioLabel('');
+    addLog('MC2: playing the question audio once…');
+
+    let clicked = false;
+    const events = audio.events && audio.events.length ? audio.events : verbEventNames(audio.obj);
+    const eventName = events.find(name => /^(pointerup|click|tap|mouseup|touchend)$/i.test(name));
+    if (eventName && audio.obj && typeof audio.obj.emit === 'function') {
+      clicked = emitOnObject(audio.obj, eventName, point);
+    } else {
+      clicked = await safeCanvasPointerClickWorld(point.x, point.y, '#4ade80', 15);
+    }
+
+    if (clicked) await sleep(CONFIG.mc2AfterPlayMs);
+    state.mc2AudioCaptureBusy = false;
+    if (!clicked) {
+      state.mc2AudioCaptureSignature = '';
+      state.mc2AudioCaptureUntil = 0;
+      setStatus('MC2 Listening: question audio click failed');
+      return false;
+    }
+    if (state.mc2CapturedAudioSignature === signature) return true;
+    // Zen can still be playing its automatic question audio when this click
+    // lands. The game's cooldown then ignores it; allow a later retry.
+    state.lastPlayedKey = null;
+    setStatus('MC2 Listening: waiting for audio from the question speaker');
+    return false;
+  }
+
+  function mc2MarkQuestionChanged(signature, now) {
+    if (state.lastMC2Sig === signature) return false;
+    const hadPrevious = state.lastMC2Sig !== null;
+    state.lastMC2Sig = signature;
+    state.mc2QuestionChangeAt = now;
+    if (hadPrevious) {
+      state.mc2AnsweredQuestionSignature = '';
+      state.mc2RejectedQuestionSignature = '';
+      state.mc2RetryQuestionSignature = signature;
+      state.mc2RetryCount = 0;
+      state.mc2RetryAfter = 0;
+      state.mc2LastKey = null;
+      state.lastPlayedKey = null;
+      mc2ClearListeningAnswer();
+    }
+    return hadPrevious;
+  }
+
+  function mc2ClearPendingListening() {
+    state.mc2PendingKey = null;
+    state.mc2PendingSignature = '';
+    state.mc2PendingAudio = '';
+    state.mc2PendingLabel = '';
+    state.mc2PendingCorrect = 0;
+    state.mc2PendingIncorrect = 0;
+    state.mc2PendingSince = 0;
+    state.mc2PendingClicks = 0;
+  }
+
+  async function mc2ListeningTick() {
+    if (!state.vocab.length && !state.sentences.length) {
+      setStatus('MC2 Listening: waiting for data');
+      return;
+    }
+
+    const scene = mc2Scene();
+    if (!scene.options.length) {
+      setStatus(state.mc2PendingKey
+        ? 'MC2 Listening: waiting for the answer result / next question'
+        : 'MC2 Listening: waiting for options');
+      return;
+    }
+
+    const now = Date.now();
+    const signature = mc2QuestionSignature(scene);
+    mc2MarkQuestionChanged(signature, now);
+
+    if (state.mc2PendingKey) {
+      const correct = mc2ResultCount('correct') > state.mc2PendingCorrect;
+      const incorrect = mc2ResultCount('incorrect') > state.mc2PendingIncorrect;
+      const transitioned = signature !== state.mc2PendingSignature &&
+        now - state.mc2QuestionChangeAt >= 250;
+      if (correct) {
+        mc2ConfirmListeningAnswer('correct result confirmed', transitioned);
+        return setStatus('MC2 Listening: correct answer confirmed');
+      }
+      if (incorrect) {
+        mc2RejectListeningAnswer();
+        return;
+      }
+      if (transitioned) {
+        const label = state.mc2PendingLabel;
+        mc2ClearPendingListening();
+        mc2ClearListeningAnswer();
+        state.mc2LastKey = null;
+        addLog(`MC2 Listening advanced without a visible correct result for "${label}"`, 'err');
+        return setStatus('MC2 Listening: next question loaded; result unconfirmed');
+      }
+      if (now - state.mc2PendingSince >= 1600 && state.mc2PendingClicks < 2) {
+        const retry = scene.options.find(option =>
+          normaliseText(option.label) === normaliseText(state.mc2PendingLabel));
+        if (retry) {
+          state.mc2PendingClicks++;
+          state.mc2PendingSince = now;
+          addLog(`MC2 Listening: no result for "${state.mc2PendingLabel}"; retrying once`, 'err');
+          await clickMC2Option(retry, true);
+          return setStatus('MC2 Listening: waiting for retry result');
+        }
+      }
+      if (now - state.mc2PendingSince > 12000) {
+        setStatus('MC2 Listening: no answer confirmation after 12s; paused without another click');
+      } else {
+        setStatus('MC2 Listening: waiting for answer confirmation — no repeat click');
+      }
+      return;
+    }
+
+    if (state.mc2AnsweredQuestionSignature === signature) {
+      return setStatus('MC2 Listening: answer confirmed — waiting for next question');
+    }
+    if (state.mc2RejectedQuestionSignature === signature) {
+      return setStatus('MC2 Listening: rejected twice — waiting for a different question');
+    }
+    if (state.mc2RetryAfter && now < state.mc2RetryAfter) {
+      return setStatus('MC2 Listening: waiting briefly before the single retry');
+    }
+    if (state.mc2RetryAfter && now >= state.mc2RetryAfter) state.mc2RetryAfter = 0;
+
+    if (state.currentAnswer && state.mc2CapturedAudioSignature !== signature) {
+      mc2ClearListeningAnswer();
+    }
+    if (!state.currentAnswer) {
+      const playKey = `mc2:${signature}`;
+      if (CONFIG.autoPlay && state.lastPlayedKey !== playKey &&
+          now - (state.lastMC2PlayAttemptAt || 0) >= 1500) {
+        state.lastMC2PlayAttemptAt = now;
+        await mc2PlayListeningAudio();
+      }
+      if (!state.currentAnswer || state.mc2CapturedAudioSignature !== signature) {
+        return setStatus('MC2 Listening: waiting for question audio');
+      }
+    }
+
+    const wanted = [state.currentAnswer.word, state.currentAnswer.originalWord]
+      .filter(Boolean).map(normaliseText);
+    let answer = scene.options.find(option => wanted.includes(option.norm));
+    if (!answer) {
+      answer = scene.options.find(option => wanted.some(value =>
+        value.length > 2 && option.norm.length > 2 &&
+        (option.norm.includes(value) || value.includes(option.norm))
+      ));
+    }
+    if (!answer) {
+      state.mc2Fails++;
+      return setStatus('MC2 Listening: answer option not found');
+    }
+
+    const audioKey = baseName(state.lastAudioUrl || '');
+    const key = `${signature}|${audioKey}|${answer.norm}`;
+    if (state.mc2ListeningAnsweredKeys.has(key) || key === state.mc2LastKey) {
+      return setStatus('MC2 Listening: waiting for the next question');
+    }
+
+    state.mc2LastKey = key;
+    state.mc2PendingKey = key;
+    state.mc2PendingSignature = signature;
+    state.mc2PendingAudio = audioKey;
+    state.mc2PendingLabel = answer.label;
+    state.mc2PendingCorrect = mc2ResultCount('correct');
+    state.mc2PendingIncorrect = mc2ResultCount('incorrect');
+    state.mc2PendingSince = Date.now();
+    state.mc2PendingClicks++;
+
+    const result = await clickMC2Option(answer);
+    if (result.correct) {
+      mc2ConfirmListeningAnswer('correct result confirmed', false);
+      return setStatus('MC2 Listening: answer confirmed — waiting for next question');
+    }
+    if (result.incorrect) {
+      mc2RejectListeningAnswer();
+      return;
+    }
+    if (!result.clicked) {
+      addLog(`MC2 could not dispatch one click for "${answer.label}"`, 'err');
+    }
+    setStatus('MC2 Listening: waiting for answer confirmation — no repeat click');
   }
 
   function mc2EntryForPrompt(prompt) {
@@ -2324,202 +2681,46 @@
     });
   }
 
-  async function clickMC2Option(option) {
-    if (!option || !option.bounds) return false;
+  async function clickMC2Option(option, canvasOnly) {
+    if (!option || !option.bounds) return {clicked: false, correct: false, incorrect: false};
 
-    const beforeSig = mc2Signature();
+    const beforeQuestionSignature = mc2QuestionSignature();
     const beforeCorrect = mc2ResultCount('correct');
     const beforeIncorrect = mc2ResultCount('incorrect');
+    const bounds = option.bounds;
+    const point = {x: bounds.x + bounds.width / 2, y: bounds.y + bounds.height / 2};
+    addLog(`MC2 click once: "${option.label}"`, 'ok');
 
-    addLog(`MC2 click "${option.label}"`, 'ok');
-
-    if (
-      option.direct &&
-      option.obj &&
-      typeof option.obj.emit === 'function'
-    ) {
-      try {
-        option.obj.emit(
-          'pointerup',
-          makeVerbEvent(option.obj, 'pointerup')
-        );
-
-        await sleep(CONFIG.mc2AfterClickMs);
-      } catch (_) {}
+    // Dispatch one input path only. The old direct-event + canvas fallback
+    // could click the same (often bottom-left) answer twice when the UI had
+    // not repainted quickly enough.
+    const events = option.events && option.events.length ? option.events : verbEventNames(option.obj);
+    const eventName = events.find(name => /^(pointerup|click|tap|mouseup|touchend)$/i.test(name));
+    let clicked = false;
+    if (!canvasOnly && eventName && option.obj && typeof option.obj.emit === 'function') {
+      clicked = emitOnObject(option.obj, eventName, point);
     }
-
-    let changed =
-      mc2Signature() !== beforeSig ||
-      mc2ResultCount('correct') > beforeCorrect ||
-      mc2ResultCount('incorrect') > beforeIncorrect;
-
-    if (!changed) {
-      const b = option.bounds;
-      const x = b.x + b.width / 2;
-      const y = b.y + b.height / 2;
-
-      await safeCanvasPointerClickWorld(
-        x,
-        y,
-        '#fb7185',
-        CONFIG.mc2AfterClickMs
+    if (!clicked) {
+      clicked = await safeCanvasPointerClickWorld(
+        point.x, point.y, '#fb7185', CONFIG.mc2AfterClickMs
       );
-
-      changed =
-        mc2Signature() !== beforeSig ||
-        mc2ResultCount('correct') > beforeCorrect ||
-        mc2ResultCount('incorrect') > beforeIncorrect;
     }
+    if (clicked) await sleep(CONFIG.mc2AfterClickMs);
 
+    const afterCorrect = mc2ResultCount('correct');
+    const afterIncorrect = mc2ResultCount('incorrect');
     return {
-      clicked: true,
-      changed,
-      correct: mc2ResultCount('correct') > beforeCorrect,
-      incorrect: mc2ResultCount('incorrect') > beforeIncorrect
+      clicked,
+      correct: afterCorrect > beforeCorrect,
+      incorrect: afterIncorrect > beforeIncorrect,
+      questionChanged: mc2QuestionSignature() !== beforeQuestionSignature,
+      beforeCorrect,
+      beforeIncorrect,
+      afterCorrect,
+      afterIncorrect,
+      beforeSignature: beforeQuestionSignature,
+      afterSignature: mc2QuestionSignature()
     };
-  }
-
-  async function mc2ListeningTick() {
-    if (!state.vocab.length && !state.sentences.length) {
-      setStatus('MC2 Listening: waiting for data');
-      return;
-    }
-
-    let scene = mc2Scene();
-
-    if (!scene.options.length) {
-      setStatus('MC2 Listening: waiting for options');
-      return;
-    }
-
-    const sig = mc2Signature();
-    if (state.lastMC2Sig !== sig) {
-      state.lastMC2Sig = sig;
-      state.currentAnswer = null;
-      state.currentEntry = null;
-      state.lastAudioUrl = null;
-      state.lastPlayedKey = null;
-      setAudioLabel('');
-    }
-
-    const now = Date.now();
-    if (!state.currentAnswer) {
-      if (CONFIG.autoPlay && (state.lastPlayedKey !== `mc2:${sig}` || (now - (state.lastMC2PlayAttemptAt || 0) > 2200))) {
-        const audio = mc2FindAudioButton();
-
-        if (audio) {
-          state.lastPlayedKey = `mc2:${sig}`;
-          state.lastMC2PlayAttemptAt = now;
-          addLog('MC2: auto-playing audio…');
-
-          const b = audio.bounds;
-          const x = b.x + b.width / 2;
-          const y = b.y + b.height / 2;
-
-          if (
-            audio.obj &&
-            verbEventNames(audio.obj).includes('pointerup') &&
-            typeof audio.obj.emit === 'function'
-          ) {
-            try {
-              audio.obj.emit(
-                'pointerup',
-                makeVerbEvent(audio.obj, 'pointerup')
-              );
-            } catch (_) {
-              await safeCanvasPointerClickWorld(x, y, '#4ade80', 15);
-            }
-          } else {
-            await safeCanvasPointerClickWorld(x, y, '#4ade80', 15);
-          }
-
-          await sleep(CONFIG.mc2AfterPlayMs);
-        }
-      }
-
-      if (!state.currentAnswer && state.lastAudioUrl) {
-        const e = matchAudioToEntry(state.lastAudioUrl);
-
-        if (e) {
-          state.currentEntry = e;
-          state.currentAnswer = {
-            word: (e.word || '').trim(),
-            originalWord: (e.originalWord || '').trim()
-          };
-        }
-      }
-
-      if (!state.currentAnswer) {
-        setStatus('MC2 Listening: waiting for audio');
-        return;
-      }
-    }
-
-    scene = mc2Scene();
-
-    const wanted = [
-      state.currentAnswer.word,
-      state.currentAnswer.originalWord
-    ].filter(Boolean).map(normaliseText);
-
-    let answer = scene.options.find(o => wanted.includes(o.norm));
-
-    if (!answer) {
-      answer = scene.options.find(o =>
-        wanted.some(w =>
-          w.length > 2 &&
-          o.norm.length > 2 &&
-          (o.norm.includes(w) || w.includes(o.norm))
-        )
-      );
-    }
-
-    if (!answer) {
-      state.mc2Fails++;
-      setStatus('MC2 Listening: answer option not found');
-      return;
-    }
-
-    const key =
-      `${sig}|${baseName(state.lastAudioUrl || '')}|${answer.norm}`;
-
-    if (key === state.mc2LastKey) {
-      setStatus('MC2 Listening: waiting for next question');
-      return;
-    }
-
-    state.mc2LastKey = key;
-
-    const result = await clickMC2Option(answer);
-
-    if (result.incorrect) {
-      state.mc2Fails++;
-      state.mc2LastKey = null;
-      addLog(`✗ MC2 rejected "${answer.label}"`, 'err');
-      setStatus('MC2 Listening: incorrect');
-      return;
-    }
-
-    if (!result.changed) {
-      state.mc2Fails++;
-      state.mc2LastKey = null;
-      addLog(`? MC2 option did not react: "${answer.label}"`, 'err');
-      setStatus('MC2 Listening: retrying');
-      return;
-    }
-
-    state.mc2Fails = 0;
-    state.answeredCount++;
-    setAnsweredCount(state.answeredCount);
-    setStatus('MC2 Listening: answered');
-
-    state.currentAnswer = null;
-    state.currentEntry = null;
-    state.lastAudioUrl = null;
-    state.lastPlayedKey = null;
-    setAudioLabel('');
-
-    await sleep(CONFIG.mc2AfterClickMs);
   }
 
   async function mc2ReadingTick() {
@@ -2529,16 +2730,61 @@
     }
 
     const scene = mc2Scene();
-
-    if (!scene.prompt) {
-      setStatus('MC2 Reading: waiting for prompt');
-      return;
+    const questionSignature = mc2QuestionSignature(scene);
+    const pending = state.mc2ReadingPending;
+    if (pending) {
+      const correct = mc2ResultCount('correct') > pending.beforeCorrect;
+      const incorrect = mc2ResultCount('incorrect') > pending.beforeIncorrect;
+      if (correct) {
+        state.mc2ReadingPending = null;
+        state.mc2Fails = 0;
+        state.mc2AnsweredQuestionSignature = pending.signature;
+        markAnswerConfirmed(`MC2 Reading: ${pending.label} — correct result`, pending.key);
+        return setStatus('MC2 Reading: correct answer confirmed');
+      }
+      if (incorrect) {
+        state.mc2ReadingPending = null;
+        state.mc2ReadingRejectedSignature = pending.signature;
+        state.mc2Fails++;
+        addLog(`✗ MC2 rejected "${pending.label}"`, 'err');
+        return setStatus('MC2 Reading: incorrect result confirmed');
+      }
+      if (questionSignature !== pending.signature) {
+        if ((!scene.prompt || !scene.options.length) &&
+            Date.now() - pending.lastAttemptAt < 1800)
+          return setStatus('MC2 Reading: waiting for result during transition');
+        state.mc2ReadingPending = null;
+        state.mc2LastKey = null;
+        addLog(`MC2 question advanced without a visible correct result for "${pending.label}"`, 'err');
+        return setStatus('MC2 Reading: next question loaded; previous result unconfirmed');
+      }
+      // MC2 waits 400 ms before processing the click and can take another
+      // second to publish a result when minor results are hidden.
+      if (Date.now() - pending.lastAttemptAt < 1600) {
+        return setStatus('MC2 Reading: waiting for answer result');
+      }
+      if (pending.attempts >= 3) {
+        if (!pending.pausedLogged) {
+          pending.pausedLogged = true;
+          addLog(`MC2 Reading: no confirmed result for "${pending.label}" after three clicks`, 'err');
+          showToast(`MC2 Reading needs help with "${pending.label}"`, 'err');
+        }
+        return setStatus('MC2 Reading: no result after three clicks; paused on this question');
+      }
+      const retryOption = scene.options.find(option => option.norm === pending.answerNorm);
+      if (!retryOption) return setStatus('MC2 Reading: waiting for answer button');
+      pending.attempts++;
+      pending.lastAttemptAt = Date.now();
+      addLog(`? MC2 option did not react: "${pending.label}" (retry ${pending.attempts}/3)`, 'err');
+      await clickMC2Option(retryOption, true);
+      return setStatus('MC2 Reading: waiting for retry result');
     }
-
-    if (!scene.options.length) {
-      setStatus('MC2 Reading: waiting for options');
-      return;
-    }
+    if (!scene.prompt) return setStatus('MC2 Reading: waiting for prompt');
+    if (!scene.options.length) return setStatus('MC2 Reading: waiting for options');
+    if (state.mc2AnsweredQuestionSignature === questionSignature)
+      return setStatus('MC2 Reading: correct answer confirmed — waiting for next question');
+    if (state.mc2ReadingRejectedSignature === questionSignature)
+      return setStatus('MC2 Reading: incorrect answer — waiting for next question');
 
     const entry = mc2EntryForPrompt(scene.prompt);
 
@@ -2574,9 +2820,7 @@
       return;
     }
 
-    const sig = mc2Signature();
-    const key =
-      `${normaliseText(scene.prompt.label)}|${sig}|${answer.norm}`;
+    const key = `${questionSignature}|${answer.norm}`;
 
     if (key === state.mc2LastKey) {
       setStatus('MC2 Reading: waiting for next question');
@@ -2584,43 +2828,38 @@
     }
 
     state.mc2LastKey = key;
-
-    addLog(
-      `MC2 "${scene.prompt.label}" → "${answer.label}"`,
-      'ok'
-    );
-
-    const result = await clickMC2Option(answer);
-
-    if (result.incorrect) {
-      state.mc2Fails++;
-      state.mc2LastKey = null;
-      addLog(`✗ MC2 rejected "${answer.label}"`, 'err');
-      setStatus('MC2 Reading: incorrect');
-      return;
-    }
-
-    if (!result.changed) {
-      state.mc2Fails++;
-      state.mc2LastKey = null;
-      addLog(`? MC2 option did not react: "${answer.label}"`, 'err');
-      setStatus('MC2 Reading: retrying');
-      return;
-    }
-
-    state.mc2Fails = 0;
-    state.answeredCount++;
-    setAnsweredCount(state.answeredCount);
-    setStatus('MC2 Reading: answered');
-
-    await sleep(CONFIG.mc2AfterClickMs);
+    state.mc2ReadingPending = {
+      key, signature: questionSignature, answerNorm: answer.norm,
+      label: answer.label, attempts: 1, lastAttemptAt: Date.now(),
+      beforeCorrect: mc2ResultCount('correct'),
+      beforeIncorrect: mc2ResultCount('incorrect')
+    };
+    addLog(`MC2 "${scene.prompt.label}" → "${answer.label}"`, 'ok');
+    await clickMC2Option(answer);
+    setStatus('MC2 Reading: waiting for answer result');
   }
 
   function resetMC2State() {
     state.mc2Busy = false;
+    state.mc2ReadingPending = null;
+    state.mc2ReadingRejectedSignature = '';
     state.mc2LastKey = null;
     state.mc2Fails = 0;
     state.mc2LastSignature = null;
+    state.lastMC2Sig = null;
+    state.lastMC2PlayAttemptAt = 0;
+    state.mc2QuestionChangeAt = 0;
+    state.mc2AnsweredQuestionSignature = '';
+    state.mc2RejectedQuestionSignature = '';
+    state.mc2RetryQuestionSignature = '';
+    state.mc2RetryCount = 0;
+    state.mc2RetryAfter = 0;
+    state.mc2AudioCaptureSignature = '';
+    state.mc2AudioCaptureUntil = 0;
+    state.mc2AudioCaptureBusy = false;
+    state.mc2CapturedAudioSignature = '';
+    mc2ClearPendingListening();
+    state.mc2ListeningAnsweredKeys = new Set();
     state.currentAnswer = null;
     state.currentEntry = null;
     state.lastAudioUrl = null;
@@ -2646,6 +2885,7 @@
         kind === 'correct' &&
         (
           /new_design\/GreenBox/i.test(f) ||
+          /new_design\/BigTick/i.test(f) ||
           /ok\.png$/i.test(f) ||
           /progress\/correct/i.test(f)
         )
@@ -2655,6 +2895,7 @@
         kind === 'incorrect' &&
         (
           /new_design\/WrongBox/i.test(f) ||
+          /new_design\/BigCross/i.test(f) ||
           /progress\/incorrect/i.test(f)
         )
       ) count++;
@@ -2666,8 +2907,7 @@
   function wordPodFindAudioButton() {
     const a = state.pixiApp;
     if (!a) return null;
-
-    let best = null;
+    const found = [];
 
     walk(a.stage, (o) => {
       if (!isVisible(o, a.stage)) return;
@@ -2675,23 +2915,22 @@
       const f = fullTextureName(o);
       const n = textureName(o);
 
-      if (!/audioWordPod/i.test(f) && !/audioWordPod/i.test(n)) return;
+      if (!/audioWordPod|new_design\/AudioButton/i.test(`${f} ${n}`)) return;
 
       const b = boundsOf(o);
       if (!b || b.width < 12 || b.height < 12 || b.width > 180 || b.height > 180) return;
-
-      if (!best || (b.width * b.height) < best.area) {
-        best = {
-          obj: o,
-          bounds: b,
-          area: b.width * b.height,
-          texture: f || n || '?',
-          events: verbEventNames(o)
-        };
-      }
+      const events = verbEventNames(o);
+      if (!events.some(name => /^pointerup$/i.test(name))) return;
+      found.push({obj: o, bounds: b, texture: f || n || '?', events});
     });
 
-    return best;
+    // WordPod's CardDisplay uses new_design/AudioButton for its question.
+    // Multiple visible speakers are ambiguous, so avoid playing a card from
+    // the previous animation or an unrelated page control.
+    const cardButtons = found.filter(button => /new_design\/AudioButton/i.test(button.texture));
+    if (cardButtons.length === 1) return cardButtons[0];
+    const legacyButtons = found.filter(button => /audioWordPod/i.test(button.texture));
+    return legacyButtons.length === 1 ? legacyButtons[0] : null;
   }
 
   function wordPodFindNextButton() {
@@ -2815,12 +3054,19 @@
     return { prompt, prompts, audio, next, textBox };
   }
 
+  function wordPodExactAnswerCandidates(entry) {
+    if (!entry) return [];
+    // WordPod compares input with currentContent.learningWord, which
+    // UserContent builds from vocabTranslations.word. The interface word is
+    // the clue, never a writing answer.
+    const word = String(entry.word || '').trim();
+    return word ? [word] : [];
+  }
+
   function wordPodAnswerCandidates(entry, promptText) {
     if (!entry) return [];
-
     const out = [];
     const seen = new Set();
-
     function push(v) {
       if (typeof v !== 'string' || !v.trim()) return;
       const raw = v.trim();
@@ -2829,27 +3075,43 @@
       seen.add(n);
       out.push(raw);
     }
+    if (promptText) mc2AnswerTextsForEntry(entry, promptText).forEach(push);
+    [entry.word, entry.originalWord, entry.translatedWord,
+      entry.translation, entry.original, entry.translated].forEach(push);
+    return promptText
+      ? out.filter(v => normaliseText(v) !== normaliseText(promptText))
+      : out;
+  }
 
-    if (promptText) {
-      const best = mc2AnswerTextsForEntry(entry, promptText);
-      best.forEach(push);
-    }
+  function wordPodEntryForPrompt(prompt) {
+    if (!prompt) return null;
+    const cue = prompt.norm || normaliseText(prompt.label);
+    const listed = Array.isArray(prompt.matches)
+      ? prompt.matches.map(match => match.entry).filter(Boolean)
+      : [];
+    const candidates = listed.length ? listed : state.vocab.filter(entry =>
+      [entry.originalWord, entry.translatedWord, entry.translation,
+        entry.original, entry.translated, entry.word]
+        .some(value => normaliseText(value) === cue));
+    if (!candidates.length) return null;
+    const direct = candidates.filter(entry => normaliseText(entry.originalWord) === cue);
+    const preferred = direct.length ? direct : candidates;
+    // API clues can live in translatedWord or another field. A unique target
+    // word is sufficient, but never guess between different target words.
+    const answers = new Set(preferred.map(entry => normaliseText(entry.word)).filter(Boolean));
+    return answers.size === 1 ? preferred[0] : null;
+  }
 
-    [
-      entry.word,
-      entry.originalWord,
-      entry.translatedWord,
-      entry.translation,
-      entry.original,
-      entry.translated
-    ].forEach(push);
-
-    if (promptText) {
-      const pn = normaliseText(promptText);
-      return out.filter(v => normaliseText(v) !== pn);
-    }
-
-    return out;
+  function wordPodActiveEntry() {
+    // LanguageNut keeps the exact current WordPod item on its active game
+    // controller. The API can contain two rows with the same English clue;
+    // only currentContent identifies which German target this turn expects.
+    if (!/#\/(?:Zen)?WordPod(?:[/?]|$)/i.test(String(location.hash || ''))) return null;
+    const controller = window.languagenutControllerObject;
+    const item = controller?.currentContent || controller?.cardDisplay?.currentContent;
+    const word = typeof item?.learningWord === 'string' ? item.learningWord.trim() : '';
+    if (!word) return null;
+    return {word, originalWord: String(item.interfaceWord || '').trim(), uid: item.contentUid};
   }
 
   async function wordPodClickControl(ctrl, marker) {
@@ -2874,17 +3136,19 @@
 
 
 
+  function gameTextInputIsVisible(input) {
+    if (!(input instanceof HTMLInputElement) || input.type !== 'text') return false;
+    const style = getComputedStyle(input);
+    const rect = input.getBoundingClientRect();
+    return style.display !== 'none' &&
+      style.visibility !== 'hidden' &&
+      Number(style.opacity) > 0 &&
+      rect.width > 20 && rect.height > 10;
+  }
+
   function wordPodInputElement() {
     const direct = document.getElementById('textInputChina');
-
-    if (
-      direct &&
-      direct instanceof HTMLInputElement &&
-      direct.type === 'text' &&
-      direct.offsetParent !== null
-    ) {
-      return direct;
-    }
+    if (gameTextInputIsVisible(direct)) return direct;
 
     // Fallback in case LanguageNut changes the id but keeps the same dedicated
     // visible text input.
@@ -3042,8 +3306,8 @@
     }
   }
 
-  async function wordPodTypeIntoDomInput(answer) {
-    const input = wordPodInputElement();
+  async function wordPodTypeIntoDomInput(answer, gameInput) {
+    const input = gameInput || wordPodInputElement();
     if (!input) return { available: false, ok: false, actual: '' };
 
     const wanted = String(answer || '').normalize('NFC');
@@ -3124,8 +3388,8 @@
     };
   }
 
-  async function wordPodPressDomEnter() {
-    const input = wordPodInputElement();
+  async function wordPodPressDomEnter(gameInput) {
+    const input = gameInput || wordPodInputElement();
     if (!input) return false;
 
     try {
@@ -3678,16 +3942,40 @@
     return true;
   }
 
+  function wordPodQuestionInstance() {
+    // WordPod's newQuestion() replaces its InputGraphicsObject each time.
+    // The same clue can recur, so prompt text alone cannot identify a turn.
+    const input = document.getElementById('textInputChina');
+    if (input && input !== state.wordPodInputNode) {
+      state.wordPodInputNode = input;
+      state.wordPodQuestionEpoch++;
+      state.wordPodLockedQuestion = null;
+      state.wordPodSubmittedKey = null;
+      state.wordPodLastSignature = null;
+      state.wordPodCandidates = [];
+      state.wordPodCandidateIndex = 0;
+      state.wordPodTypedLast = '';
+      state.wordPodLastUnresolvedKey = '';
+      state.currentAnswer = null;
+      state.currentEntry = null;
+      state.lastAudioUrl = null;
+      state.lastPlayedKey = null;
+      state.wordPodLastPlayAt = 0;
+    }
+    return state.wordPodQuestionEpoch;
+  }
+
 
   function wordPodReadingQuestionKey(scene) {
     return scene && scene.prompt
-      ? `read:${scene.prompt.norm}`
+      ? `read:${wordPodQuestionInstance()}:${scene.prompt.norm}`
       : '';
   }
 
   function wordPodListeningQuestionKey(scene, entry) {
+    const turn = wordPodQuestionInstance();
     if (scene && scene.prompt) {
-      return `listen-prompt:${scene.prompt.norm}`;
+      return `listen-prompt:${turn}:${scene.prompt.norm}`;
     }
 
     if (entry) {
@@ -3706,11 +3994,11 @@
         ''
       );
 
-      return `listen-entry:${uid}|${word}`;
+      return `listen-entry:${turn}:${uid}|${word}`;
     }
 
     const audio = baseName(state.lastAudioUrl || '');
-    return audio ? `listen-audio:${audio}` : '';
+    return audio ? `listen-audio:${turn}:${audio}` : '';
   }
 
   function wordPodUnlockForNewQuestion(questionKey) {
@@ -3740,16 +4028,18 @@
     }
 
     const scene = wordPodScene();
+    const turn = wordPodQuestionInstance();
 
     if (!scene.audio && !scene.prompt) {
       setStatus('WordPod Listening: waiting for scene');
       return;
     }
 
-    let entry = scene.prompt ? mc2EntryForPrompt(scene.prompt) : null;
+    let entry = wordPodActiveEntry() || wordPodEntryForPrompt(scene.prompt);
+    if (!entry && state.lastAudioUrl) entry = matchAudioToEntry(state.lastAudioUrl);
 
     const sceneSig =
-      `${scene.prompt ? scene.prompt.norm : 'audio'}|` +
+      `${turn}|${scene.prompt ? scene.prompt.norm : 'audio'}|` +
       `${baseName(state.lastAudioUrl || '')}|` +
       `${scene.prompts.map(p => p.norm).join('|')}`;
 
@@ -3762,11 +4052,14 @@
     }
 
     if (!entry) {
-      if (CONFIG.autoPlay && scene.audio && state.lastPlayedKey !== `wordpod:${sceneSig}`) {
+      if (CONFIG.autoPlay && scene.audio && state.lastPlayedKey !== `wordpod:${sceneSig}` &&
+          Date.now() - state.wordPodLastPlayAt >= 1500) {
         state.lastPlayedKey = `wordpod:${sceneSig}`;
+        state.wordPodLastPlayAt = Date.now();
         addLog('WordPod: auto-playing audio…');
         await wordPodClickControl(scene.audio, '#4ade80');
         await sleep(CONFIG.wordPodAfterPlayMs);
+        if (!state.lastAudioUrl) state.lastPlayedKey = null;
       }
 
       if (state.lastAudioUrl) {
@@ -3788,10 +4081,7 @@
     }
 
     if (!state.wordPodCandidates.length) {
-      state.wordPodCandidates = wordPodAnswerCandidates(
-        entry,
-        scene.prompt ? scene.prompt.label : ''
-      );
+      state.wordPodCandidates = wordPodExactAnswerCandidates(entry);
       state.wordPodCandidateIndex = 0;
 
       addLog(
@@ -3856,24 +4146,7 @@
       addLog(`✗ WordPod rejected "${answer}"`, 'err');
       state.wordPodSubmittedKey = null;
       state.wordPodFails++;
-
-      if (wordPodInputElement()) {
-        state.running = false;
-        setStatus('WordPod Listening: incorrect — stopped');
-        const b = document.getElementById('ln-ac-toggle');
-        if (b) {
-          b.textContent = 'Start';
-          b.classList.remove('active');
-        }
-        addLog('■ Stopped after incorrect WordPod answer', 'err');
-        return;
-      }
-
-      state.wordPodLockedQuestion = null;
-      state.wordPodSubmittedKey = null;
-      state.wordPodCandidateIndex++;
-      await wordPodClearTypedAnswer();
-      setStatus('WordPod Listening: retrying');
+      setStatus('WordPod Listening: incorrect — waiting for retry or next question');
       return;
     }
 
@@ -3935,16 +4208,23 @@
       state.wordPodSubmittedKey = null;
     }
 
-    const entry = mc2EntryForPrompt(scene.prompt);
+    const entry = wordPodActiveEntry() || wordPodEntryForPrompt(scene.prompt);
 
     if (!entry) {
-      state.wordPodFails++;
-      setStatus('WordPod Reading: prompt not in vocab');
+      if (state.wordPodLastUnresolvedKey !== questionKey) {
+        state.wordPodLastUnresolvedKey = questionKey;
+        state.wordPodFails++;
+        const matches = [...new Set((scene.prompt.matches || [])
+          .map(match => String(match.entry?.word || '').trim()).filter(Boolean))];
+        addLog(`WordPod: no unique API answer for "${scene.prompt.label}"` +
+          (matches.length ? `; API targets: ${matches.join(' / ')}` : '; no API target matches'), 'err');
+      }
+      setStatus('WordPod Reading: waiting for a unique API answer');
       return;
     }
 
     if (!state.wordPodCandidates.length) {
-      state.wordPodCandidates = wordPodAnswerCandidates(entry, scene.prompt.label);
+      state.wordPodCandidates = wordPodExactAnswerCandidates(entry);
       state.wordPodCandidateIndex = 0;
 
       addLog(
@@ -3957,8 +4237,12 @@
     }
 
     if (!state.wordPodCandidates.length) {
-      state.wordPodFails++;
-      setStatus('WordPod Reading: no answer candidates');
+      if (state.wordPodLastUnresolvedKey !== questionKey) {
+        state.wordPodLastUnresolvedKey = questionKey;
+        state.wordPodFails++;
+        addLog(`WordPod: API row for "${scene.prompt.label}" has no target word`, 'err');
+      }
+      setStatus('WordPod Reading: waiting for target word');
       return;
     }
 
@@ -4001,24 +4285,7 @@
     if (result.incorrect) {
       addLog(`✗ WordPod rejected "${answer}"`, 'err');
       state.wordPodFails++;
-
-      if (wordPodInputElement()) {
-        state.running = false;
-        setStatus('WordPod Reading: incorrect — stopped');
-        const b = document.getElementById('ln-ac-toggle');
-        if (b) {
-          b.textContent = 'Start';
-          b.classList.remove('active');
-        }
-        addLog('■ Stopped after incorrect WordPod answer', 'err');
-        return;
-      }
-
-      state.wordPodLockedQuestion = null;
-      state.wordPodSubmittedKey = null;
-      state.wordPodCandidateIndex++;
-      await wordPodClearTypedAnswer();
-      setStatus('WordPod Reading: retrying');
+      setStatus('WordPod Reading: incorrect — waiting for retry or next question');
       return;
     }
 
@@ -4036,6 +4303,10 @@
     state.wordPodFails = 0;
     state.wordPodSubmittedKey = null;
     state.wordPodLockedQuestion = null;
+    state.wordPodLastUnresolvedKey = '';
+    state.wordPodInputNode = null;
+    state.wordPodQuestionEpoch = 0;
+    state.wordPodLastPlayAt = 0;
     state.currentAnswer = null;
     state.currentEntry = null;
     state.lastAudioUrl = null;
@@ -4094,34 +4365,64 @@
 
   function skyRiseScene() {
     const prompts = collectSkyRisePromptTexts();
-    const input = wordPodInputElement();
+    // Never fall back to the autocompleter panel's webhook field while the
+    // game temporarily hides its input during answer feedback.
+    const candidate = document.getElementById('textInputChina');
+    const input = gameTextInputIsVisible(candidate) ? candidate : null;
+    const current = skyRiseActiveEntry();
 
     let prompt = null;
 
-    if (prompts.length) {
+    if (current) {
+      // Reading and listening both use the same text answer input. Listening
+      // can hide the clue, but currentContent still identifies the answer.
+      const label = current.originalWord || 'Listening question';
+      prompt = {label, norm: normaliseText(label)};
+    } else if (prompts.length) {
       // The question/prompt is normally the highest matching vocab text.
       // Input feedback/typed answer tends to appear at or below the textbox.
       prompt = prompts[0];
     }
 
-    return { prompt, prompts, input };
+    return { prompt, prompts, input, current };
+  }
+
+  function skyRiseActiveEntry() {
+    if (!/#\/(?:Zen)?SkyRise(?:[/?]|$)/i.test(String(location.hash || ''))) return null;
+    const item = window.languagenutControllerObject?.currentContent;
+    const word = typeof item?.learningWord === 'string' ? item.learningWord.trim() : '';
+    if (!word) return null;
+    return {obj: item, word, originalWord: String(item.interfaceWord || '').trim(), uid: item.contentUid};
+  }
+
+  function skyRiseQuestionKey(scene) {
+    const item = scene?.current?.obj;
+    if (item && item !== state.skyRiseCurrentItem) {
+      state.skyRiseCurrentItem = item;
+      state.skyRiseQuestionEpoch++;
+    }
+    return scene?.prompt
+      ? `${state.skyRiseQuestionEpoch}:${scene.current?.uid ?? ''}:${scene.prompt.norm}`
+      : '';
   }
 
   function resetSkyRiseState() {
     state.skyRiseBusy = false;
     state.skyRiseLastQuestion = null;
     state.skyRiseLockedQuestion = null;
+    state.skyRiseCurrentItem = null;
+    state.skyRiseQuestionEpoch = 0;
     state.skyRiseFails = 0;
     setPromptLabel('');
   }
 
   async function skyRiseTick() {
-    if (!state.vocab.length) {
-      setStatus('Skyrise: waiting for vocab');
+    const scene = skyRiseScene();
+
+    if (!state.vocab.length && !state.sentences.length && !scene.current) {
+      setStatus('Skyrise: waiting for data');
       return;
     }
-
-    const scene = skyRiseScene();
 
     if (!scene.input) {
       setStatus('Skyrise: waiting for text input');
@@ -4135,7 +4436,7 @@
 
     setPromptLabel(scene.prompt.label);
 
-    const questionKey = scene.prompt.norm;
+    const questionKey = skyRiseQuestionKey(scene);
 
     if (
       state.skyRiseLockedQuestion &&
@@ -4150,7 +4451,7 @@
       return;
     }
 
-    const entry = mc2EntryForPrompt(scene.prompt);
+    const entry = scene.current || mc2EntryForPrompt(scene.prompt);
 
     if (!entry) {
       state.skyRiseFails++;
@@ -4158,7 +4459,9 @@
       return;
     }
 
-    const answers = wordPodAnswerCandidates(entry, scene.prompt.label);
+    const answers = scene.current
+      ? wordPodExactAnswerCandidates(entry)
+      : wordPodAnswerCandidates(entry, scene.prompt.label);
 
     if (!answers.length) {
       state.skyRiseFails++;
@@ -4177,7 +4480,7 @@
       'ok'
     );
 
-    const typed = await wordPodTypeIntoDomInput(answer);
+    const typed = await wordPodTypeIntoDomInput(answer, scene.input);
 
     if (!typed.available || !typed.ok) {
       state.skyRiseLockedQuestion = null;
@@ -4195,11 +4498,11 @@
 
     const beforePrompt = questionKey;
 
-    await wordPodPressDomEnter();
+    await wordPodPressDomEnter(scene.input);
     await sleep(CONFIG.wordPodAfterSubmitMs);
 
     const after = skyRiseScene();
-    const afterKey = after.prompt ? after.prompt.norm : '';
+    const afterKey = skyRiseQuestionKey(after);
 
     if (afterKey && afterKey !== beforePrompt) {
       state.answeredCount++;
@@ -7557,9 +7860,9 @@
       return;
     }
 
-    // Dynamic poll for container movement or consumption (up to 800ms, or faster with fastAnimations)
-    const maxWaitMs = state.fastAnimations ? 150 : 800;
-    const pollInterval = state.fastAnimations ? 30 : 80;
+    // Dynamic poll for container movement or consumption.
+    const maxWaitMs = 800;
+    const pollInterval = 80;
     const startTime = Date.now();
     let accepted = false;
 
@@ -7576,7 +7879,7 @@
     if (!accepted) {
       const pt = worldToClient(next.bounds);
       if (pt) fireClickAt(pt.x, pt.y, '#38bdf8');
-      await sleep(state.fastAnimations ? 100 : 300);
+      await sleep(300);
       const after = collectOceanContainers();
       accepted = oceanContainerMovedOrGone(next, after);
     }
@@ -7785,7 +8088,7 @@
 
   function wordPopSignature() {
     return collectWordPopBubbles()
-      .map(b => `${normaliseText(b.label)}@${Math.round(b.bubbleBounds.x)}:${Math.round(b.bubbleBounds.y)}`)
+      .map(b => normaliseText(b.label)).sort()
       .join('|');
   }
 
@@ -7879,7 +8182,8 @@
       state.currentEntry && state.currentEntry.translatedWord,
       state.currentEntry && state.currentEntry.translation,
       state.currentEntry && state.currentEntry.original,
-      state.currentEntry && state.currentEntry.translated
+      state.currentEntry && state.currentEntry.translated,
+      ...state.wordPopTranslationTerms
     ]
       .filter(v => typeof v === 'string' && v.trim())
       .map(v => v.trim());
@@ -8258,6 +8562,10 @@
     if (state.wordPopAudioBusy) return false;
 
     if (!force && state.lastPlayedKey === sig) return true;
+    if (!force && state.lastPlayedKey === 'wordpop-current' && sig) {
+      state.lastPlayedKey = sig;
+      return true;
+    }
 
     const audio = findWordPopAudioButton();
     if (!audio) return false;
@@ -8281,34 +8589,6 @@
       // First use the normal canvas pointer path.
       await safeCanvasPointerClickWorld(x, y, '#4ade80', 15);
       await sleep(CONFIG.wordPopAfterPlayMs);
-
-      // If no audio URL was captured, try the nearest PIXI pointerup listener
-      // once as a fallback.
-      if (!state.currentAnswer && !state.lastAudioUrl) {
-        let p = audio.obj;
-        let depth = 0;
-
-        while (p && depth < 5) {
-          const pb = boundsOf(p);
-          if (!pb || pb.width > 320 || pb.height > 180) break;
-
-          const evs = typeof verbEventNames === 'function'
-            ? verbEventNames(p)
-            : [];
-
-          if (evs.includes('pointerup') && typeof p.emit === 'function') {
-            try {
-              p.emit('pointerup', makeVerbEvent(p, 'pointerup'));
-              addLog('WordPop: PIXI audio fallback');
-            } catch (_) {}
-            await sleep(CONFIG.wordPopAfterPlayMs);
-            break;
-          }
-
-          p = p.parent;
-          depth++;
-        }
-      }
 
       if (state.currentAnswer) {
         addLog(
@@ -8348,23 +8628,6 @@
     }
 
 
-    if (m === 'skyrise') {
-      if (state.skyRiseBusy) return;
-
-      state.skyRiseBusy = true;
-      try {
-        await skyRiseTick();
-      } catch (e) {
-        const msg = e && e.message ? e.message : String(e);
-        addLog(`Skyrise runtime error: ${msg}`, 'err');
-        setStatus('Skyrise: runtime error');
-        log('Skyrise runtime error', e);
-      } finally {
-        state.skyRiseBusy = false;
-      }
-      return;
-    }
-
     if (m === 'wordpop-listening') {
         const bubbles = collectWordPopBubbles();
         const audio = findWordPopAudioButton();
@@ -8374,7 +8637,7 @@
         );
 
         if (audio) {
-          const sig = wordPopSignature() || `wordpop-start-${Date.now()}`;
+          const sig = wordPopSignature() || 'wordpop-current';
 
           state.lastPlayedKey = null;
           state.wordPopLastKey = null;
@@ -8416,14 +8679,69 @@
     state.wordPopLastSignature = null;
     state.wordPopBusy = false;
     state.wordPopAudioBusy = false;
+    state.wordPopTranslationTriedKey = '';
+    state.wordPopTranslationTerms = [];
+    state.wordPopNextPlayAt = 0;
     state.currentAnswer = null;
     state.currentEntry = null;
     state.lastAudioUrl = null;
     state.lastPlayedKey = null;
+    state.wordPopControllerItem = null;
+    state.wordPopControllerQuestion = null;
     setAudioLabel('');
   }
 
+  function wordPopActiveController() {
+    if (!/#\/(?:Zen)?WordPop(?:[/?]|$)/i.test(String(location.hash || ''))) return null;
+    const controller = window.languagenutControllerObject;
+    return controller && Array.isArray(controller.bubbles) &&
+      controller.vocabBox?.currentContent ? controller : null;
+  }
+
+  function wordPopControllerTick(controller) {
+    const item = controller.vocabBox.currentContent;
+    const question = controller.currentQuestion;
+    if (state.wordPopControllerItem === item &&
+        state.wordPopControllerQuestion === question) {
+      setStatus('WordPop: waiting for next question');
+      return;
+    }
+    if (!controller.isGameInPlay || !controller.allowClick) {
+      setStatus('WordPop: waiting for question');
+      return;
+    }
+
+    // The game sets this flag on the exact bubble it will accept. Its
+    // displayed text can be ambiguous (for example, "I/We have …").
+    const bubble = controller.bubbles.find(candidate =>
+      candidate?.isCorrect === true &&
+      !candidate.isClickDisabled &&
+      candidate.compObject?.graphicsObject
+    );
+    if (!bubble) {
+      setStatus('WordPop: waiting for correct bubble');
+      return;
+    }
+
+    controller.submitAnswer(bubble);
+    if (controller.allowClick !== false) {
+      setStatus('WordPop: answer was not accepted');
+      return;
+    }
+
+    state.wordPopControllerItem = item;
+    state.wordPopControllerQuestion = question;
+    state.wordPopFails = 0;
+    state.answeredCount++;
+    setAnsweredCount(state.answeredCount);
+    addLog(`WordPop correct bubble: "${bubble.text || item.learningWord || ''}"`, 'ok');
+    setStatus('WordPop: answered');
+  }
+
   async function wordPopListeningTick() {
+    const controller = wordPopActiveController();
+    if (controller) return wordPopControllerTick(controller);
+    if (Date.now() < state.wordPopNextPlayAt) return setStatus('WordPop: waiting for next round');
     if (!state.vocab.length) {
       setStatus('WordPop: waiting for vocab');
       return;
@@ -8479,7 +8797,23 @@
       state.wordPopLastKey = null;
     }
 
-    const textButtons = collectWordPopAnswerButtons();
+    let textButtons = collectWordPopAnswerButtons();
+
+    if (!textButtons.length && bubbles.length && state.currentAnswer &&
+        state.wordPopTranslationTriedKey !== `${sig}:${baseName(state.lastAudioUrl || '')}`) {
+      state.wordPopTranslationTriedKey = `${sig}:${baseName(state.lastAudioUrl || '')}`;
+      const sources = [state.currentAnswer.word, state.currentAnswer.originalWord]
+        .filter(Boolean).filter((value, index, list) => list.indexOf(value) === index);
+      const translated = await Promise.all(sources.flatMap(value => ['en', 'de']
+        .map(language => translateWithLibre(value, language))));
+      const optionSet = new Set(bubbles.map(b => normaliseText(b.label)));
+      const fallbackMatches = [...new Set(translated.filter(value =>
+        typeof value === 'string' && optionSet.has(normaliseText(value)))
+        .map(value => normaliseText(value)))];
+      state.wordPopTranslationTerms = fallbackMatches.length === 1 ? fallbackMatches : [];
+      textButtons = collectWordPopAnswerButtons();
+      if (textButtons.length) addLog(`WordPop translation fallback matched ${state.wordPopTranslationTerms.join(' / ')}`, 'ok');
+    }
 
     if (!textButtons.length) {
       state.wordPopFails++;
@@ -8561,6 +8895,10 @@
     state.currentEntry = null;
     state.lastAudioUrl = null;
     state.lastPlayedKey = null;
+    state.wordPopLastKey = null;
+    state.wordPopNextPlayAt = Date.now() + Math.max(450, CONFIG.wordPopAfterClickMs);
+    state.wordPopTranslationTerms = [];
+    state.wordPopTranslationTriedKey = '';
     setAudioLabel('');
 
     await sleep(CONFIG.wordPopAfterClickMs);
@@ -10786,32 +11124,120 @@
     }
   }
 
-  function raceDriverScene() {
-    const stage = state.pixiApp.stage;
-    let vehicle = null, obstacles = null, collected = null, prompt = '';
-    for (const obj of stage.children || []) {
-      if (/raceDriver\/vehicles\//i.test(fullTextureName(obj))) vehicle = obj;
-      // The game stores `lane` on its own CompositeGraphicsObject, but the
-      // PIXI.Container exposed here does not inherit that custom property.
-      // Its three rendered choices still sit at the fixed lane coordinates.
-      if (obj.children?.length && obj.children.every(child =>
-        typeof child.children?.[1]?.text === 'string' &&
-        [260, 360, 480].some(lane => Math.abs(child.y - lane) < 25)))
-        obstacles = obj.children;
-      if (obj.children?.length && obj.children.every(child =>
-        typeof child.text === 'string' && child.text.trim() &&
-        (boundsOf(child)?.y || 0) > 180 && (boundsOf(child)?.y || 0) < 330)) collected = obj.children;
+  function raceDriverKeyEvent(type, name, keyCode) {
+    const code = Number(keyCode) || 0;
+    const options = {
+      key: name, code: name, keyCode: code, which: code, charCode: code,
+      bubbles: true, cancelable: true, composed: true, view: window
+    };
+    let event;
+    try { event = new KeyboardEvent(type, options); }
+    catch (_) { event = document.createEvent('KeyboardEvent'); event.initEvent(type, true, true); }
+    for (const prop of ['keyCode', 'which', 'charCode']) {
+      try { Object.defineProperty(event, prop, {configurable: true, get: () => code}); }
+      catch (_) { try { Object.defineProperty(event, prop, {value: code}); } catch (_) {} }
     }
+    try { document.dispatchEvent(event); } catch (_) {}
+    try { window.dispatchEvent(event); } catch (_) {}
+    try {
+      const handler = type === 'keyup' ? window.onkeyup : window.onkeydown;
+      if (typeof handler === 'function') handler.call(window, event);
+    } catch (_) {}
+    return event;
+  }
+
+  function raceDriverScene() {
+    const stage = state.pixiApp && state.pixiApp.stage;
+    if (!stage) return {vehicle: null, entry: null, prompt: '', targets: []};
+    let vehicle = null;
+    walk(stage, obj => {
+      if (!vehicle && /raceDriver\/vehicles\//i.test(fullTextureName(obj)) &&
+          isVisible(obj, stage)) vehicle = obj;
+    });
     const entry = state.sentences.find(sentence => {
       const wanted = normaliseText(sentence.originalSentence);
       if (!wanted) return false;
       let found = false;
-      walk(stage, obj => { if (typeof obj.text === 'string' &&
-        normaliseText(obj.text) === wanted && isVisible(obj, stage)) found = true; });
+      walk(stage, obj => {
+        if (typeof obj.text === 'string' && normaliseText(obj.text) === wanted &&
+            isVisible(obj, stage)) found = true;
+      });
       return found;
     });
-    if (entry) prompt = String(entry.originalSentence || '').trim();
-    return {vehicle, obstacles: obstacles || [], collected: collected || [], entry, prompt};
+    const prompt = entry ? String(entry.originalSentence || '').trim() : '';
+    return {vehicle, entry, prompt, targets: []};
+  }
+
+  function raceDriverCollectedCount(chunks) {
+    const total = Array.isArray(chunks) ? chunks.length : 0;
+    let sceneCount = 0;
+    const stage = state.pixiApp && state.pixiApp.stage;
+    if (stage && total) {
+      // The game's correctChunkContainer is a direct stage child. Unlike the
+      // screen-reader alert, its children retain every collected chunk until
+      // the sentence changes. The alert gets overwritten by countdown text.
+      for (const group of stage.children || []) {
+        const labels = (group.children || []).filter(child =>
+          typeof child.text === 'string' && isVisible(child, stage) &&
+          boundsOf(child)?.y >= 60 && boundsOf(child)?.y <= 350
+        ).map(child => normaliseChunk(child.text));
+        let prefix = 0;
+        while (prefix < labels.length && prefix < total &&
+               labels[prefix] === normaliseChunk(chunks[prefix]?.text)) prefix++;
+        if (prefix === labels.length && prefix > sceneCount) sceneCount = prefix;
+      }
+    }
+    const sources = [];
+    try {
+      const alert = document.getElementById('hiddenAlertContainer');
+      if (alert) sources.push(String(alert.textContent || alert.innerText || ''));
+    } catch (_) {}
+    // Some LanguageNut builds place the same live announcement in a status
+    // node rather than the hidden alert container.
+    try {
+      document.querySelectorAll('[role="status"], [aria-live="polite"], [aria-live="assertive"]').forEach(node => {
+        if (!node.closest('#ln-ac-panel')) sources.push(String(node.textContent || ''));
+      });
+    } catch (_) {}
+    for (const text of sources) {
+      const match = text.match(/(?:^|\s)(.+?)\s+collected,\s*(\d+)\s+of\s+(\d+)/i);
+      if (!match) continue;
+      const count = Number(match[2]);
+      const announcedTotal = Number(match[3]);
+      if (total && announcedTotal !== total) continue;
+      const announcedChunk = normaliseChunk(match[1]);
+      const expectedChunk = normaliseChunk(chunks[count - 1]?.text);
+      if (count > 0 && expectedChunk && announcedChunk &&
+          announcedChunk !== expectedChunk && !announcedChunk.endsWith(expectedChunk)) continue;
+      return Math.max(sceneCount, Math.max(0, Math.min(total || announcedTotal, count)));
+    }
+    return sceneCount;
+  }
+
+  function raceDriverTarget(scene, chunkText) {
+    const stage = state.pixiApp && state.pixiApp.stage;
+    if (!stage || !scene.vehicle) return null;
+    const wanted = normaliseChunk(chunkText);
+    const vehicleBounds = boundsOf(scene.vehicle);
+    if (!wanted || !vehicleBounds) return null;
+    const vehicleX = vehicleBounds.x + vehicleBounds.width / 2;
+    let best = null;
+    walk(stage, obj => {
+      if (!obj || typeof obj.text !== 'string' || !isVisible(obj, stage) ||
+          normaliseChunk(obj.text) !== wanted) return;
+      const textBounds = boundsOf(obj);
+      if (!textBounds || textBounds.width <= 0 || textBounds.height <= 0) return;
+      const obstacle = obj.parent || obj;
+      if (obstacle.hasProcessed) return;
+      const textCenterX = textBounds.x + textBounds.width / 2;
+      const ahead = textBounds.x + textBounds.width >= vehicleBounds.x;
+      const distance = ahead ? Math.max(0, textCenterX - vehicleX) : 100000 + vehicleX - textCenterX;
+      if (!best || distance < best.distance) best = {
+        text: obj, obstacle, bounds: textBounds, distance, ahead,
+        missed: !ahead
+      };
+    });
+    return best;
   }
 
   function raceDriverBoost(pressed, target) {
@@ -10820,13 +11246,11 @@
       return;
     }
     const now = Date.now();
-    // RaceDriverGameController.sendObstacles() clears its ArrowRight key for
-    // every new group. Reassert keydown on a new rendered target and while
-    // holding, since the game can reset its key without a matching keyup.
+    // The game resets its key state as obstacles respawn, so reassert ArrowRight
+    // regularly even though this userscript keeps it logically held.
     if (pressed && state.raceRightHeld && state.raceBoostTarget === target &&
         now - state.raceBoostAssertAt < 120) return;
-    const options = {key: 'ArrowRight', code: 'ArrowRight', bubbles: true, cancelable: true};
-    window.dispatchEvent(new KeyboardEvent(pressed ? 'keydown' : 'keyup', options));
+    raceDriverKeyEvent(pressed ? 'keydown' : 'keyup', 'ArrowRight', 39);
     state.raceRightHeld = pressed;
     state.raceBoostTarget = pressed ? target : null;
     state.raceBoostAssertAt = pressed ? now : 0;
@@ -10834,30 +11258,29 @@
 
   async function raceDriverTick() {
     const scene = raceDriverScene();
+    const boostKey = 'race-driver';
+    // Speed boost stays held throughout the activity; steering must never
+    // release it. Reassertion is throttled inside raceDriverBoost().
+    raceDriverBoost(true, boostKey);
     if (!scene.entry || !scene.vehicle) {
-      raceDriverBoost(false);
-      return setStatus('Race Driver: waiting for sentence');
+      return setStatus('Race Driver: holding boost; waiting for sentence/vehicle');
     }
     const key = String(scene.entry.uid || scene.prompt);
     if (key !== state.raceLastQuestion) {
-      raceDriverBoost(false);
       state.raceLastQuestion = key;
       state.raceLastChunks = 0;
+      state.raceMissLogKey = '';
     }
     const chunks = Array.isArray(scene.entry.chunks) ? scene.entry.chunks : [];
-    // A previous sentence's text can remain on screen during the transition.
-    // Count only chunks that match this sentence in order, and retain the
-    // confirmed count while the container animates out of the scan area.
-    let visibleCollected = 0;
-    for (const piece of scene.collected) {
-      if (normaliseText(piece.text) !== normaliseText(chunks[visibleCollected]?.text)) break;
-      visibleCollected++;
-    }
-    const collected = Math.min(chunks.length,
-      Math.max(visibleCollected, state.raceLastChunks));
+    if (!chunks.length) return setStatus('Race Driver: waiting for sentence chunks');
+
+    // The game publishes a live accessibility announcement in the DOM. Use
+    // its counter as the source of truth; keep the last count during animations.
+    const domCollected = raceDriverCollectedCount(chunks);
+    const collected = Math.max(state.raceLastChunks, domCollected);
     if (collected > state.raceLastChunks) {
-      raceDriverBoost(false);
       state.raceLastChunks = collected;
+      state.raceMissLogKey = '';
       setProgress(collected, chunks.length);
       addLog(`Race Driver collected ${collected}/${chunks.length}: ${chunks[collected - 1].text}`, 'ok');
       if (collected === chunks.length) {
@@ -10865,37 +11288,32 @@
         setAnsweredCount(state.answeredCount);
       }
     }
-    const wanted = chunks[collected] && normaliseText(chunks[collected].text);
-    if (!wanted) {
-      raceDriverBoost(false);
-      return setStatus('Race Driver: waiting for next sentence');
+    const current = chunks[collected];
+    if (!current) return setStatus('Race Driver: holding boost; waiting for next sentence');
+    const target = raceDriverTarget(scene, current.text);
+    setPromptLabel(`${scene.prompt} → ${current.text}`);
+    if (!target) return setStatus(`Race Driver: holding boost; waiting for ${current.text}`);
+    if (target.missed) {
+      const missKey = `${key}::${collected}::${normaliseChunk(current.text)}`;
+      if (state.raceMissLogKey !== missKey) {
+        state.raceMissLogKey = missKey;
+        addLog(`Race Driver missed ${current.text}; waiting for retry`, 'err');
+      }
+      return setStatus(`Race Driver: missed ${current.text}; holding boost`);
     }
-    const obstacle = scene.obstacles.find(obj =>
-      normaliseText(obj.children?.[1]?.text) === wanted && !obj.hasProcessed);
-    if (!obstacle) {
-      raceDriverBoost(false);
-      return setStatus(`Race Driver: waiting for ${chunks[collected].text}`);
+
+    const vehicleBounds = boundsOf(scene.vehicle);
+    const vehicleCenterY = vehicleBounds.y + vehicleBounds.height / 2;
+    const targetCenterY = target.bounds.y + target.bounds.height / 2;
+    const delta = targetCenterY - vehicleCenterY;
+    if (Math.abs(delta) <= 12) {
+      return setStatus(`Race Driver: boosting toward ${current.text}`);
     }
-    const obstacleWidth = obstacle.children?.[0]?.width || obstacle.width || 0;
-    if (obstacle.x + obstacleWidth < scene.vehicle.x) {
-      raceDriverBoost(false);
-      return setStatus(`Race Driver: missed ${chunks[collected].text}; waiting for retry`);
-    }
-    setPromptLabel(`${scene.prompt} → ${chunks[collected].text}`);
-    const delta = obstacle.y - scene.vehicle.y;
-    if (Math.abs(delta) <= 24) {
-      raceDriverBoost(true, obstacle);
-      return setStatus(`Race Driver: boosting toward ${chunks[collected].text}`);
-    }
-    raceDriverBoost(false);
     const keyName = delta < 0 ? 'ArrowUp' : 'ArrowDown';
-    const options = {key: keyName, code: keyName, bubbles: true, cancelable: true};
-    window.dispatchEvent(new KeyboardEvent('keydown', options));
-    // Short pulses near the lane avoid jumping past it and alternating
-    // between Up and Down forever, which would prevent the boost.
-    await new Promise(resolve => setTimeout(resolve, Math.abs(delta) < 60 ? 25 : 70));
-    window.dispatchEvent(new KeyboardEvent('keyup', options));
-    setStatus(`Race Driver: steering ${keyName === 'ArrowUp' ? 'up' : 'down'} to ${chunks[collected].text}`);
+    raceDriverKeyEvent('keydown', keyName, keyName === 'ArrowUp' ? 38 : 40);
+    await sleep(Math.abs(delta) < 55 ? 25 : 70);
+    raceDriverKeyEvent('keyup', keyName, keyName === 'ArrowUp' ? 38 : 40);
+    setStatus(`Race Driver: steering ${keyName === 'ArrowUp' ? 'up' : 'down'} to ${current.text}; boost held`);
   }
 
   // ============ SENTENCE DICTATION ============
@@ -11019,7 +11437,7 @@
       setStatus('A-Level Photo: waiting for answer controls');
       return;
     }
-    const answer = input.value.trim() || photoExamAnswer(question);
+    const answer = input.value.trim() || humanizeLongAnswer(photoExamAnswer(question));
     if (!input.value.trim()) {
       const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
       if (setter) setter.call(input, answer);
@@ -11312,7 +11730,8 @@
     walk(a.stage, o => {
       if (found || !isVisible(o, a.stage)) return;
       const t = typeof o.text === 'string' ? o.text.trim() : '';
-      if (!/^start(?:\s+(?:now|game|exam|test))?!?$/i.test(t)) return;
+      const racePlay = /#\/RaceDriverGame(?:[/?]|$)/i.test(String(location.href || '')) && /^play!?$/i.test(t);
+      if (!/^start(?:\s+(?:now|game|exam|test))?!?$/i.test(t) && !racePlay) return;
       let target = o;
       if (o.parent && isVisible(o.parent, a.stage)) {
         const pb = boundsOf(o.parent);
@@ -11364,7 +11783,8 @@
           node.innerText || node.value || node.getAttribute('aria-label') || ''
         ).trim();
         const r = node.getBoundingClientRect();
-        return /^start(?:\s+(?:now|game|exam|test))?!?$/i.test(text) && r.width > 20 && r.height > 15;
+        const racePlay = /#\/RaceDriverGame(?:[/?]|$)/i.test(String(location.href || '')) && /^play!?$/i.test(text);
+        return (/^start(?:\s+(?:now|game|exam|test))?!?$/i.test(text) || racePlay) && r.width > 20 && r.height > 15;
       }) || null;
     } catch (_) {
       return null;
@@ -11497,14 +11917,15 @@
     const inputPrototype = input instanceof HTMLTextAreaElement
       ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
     const setter = Object.getOwnPropertyDescriptor(inputPrototype, 'value')?.set;
-    if (setter) setter.call(input, entry.answer);
-    else input.value = entry.answer;
+    const answer = humanizeLongAnswer(entry.answer);
+    if (setter) setter.call(input, answer);
+    else input.value = answer;
     input.dispatchEvent(new InputEvent('input', {
-      bubbles: true, inputType: 'insertText', data: entry.answer
+      bubbles: true, inputType: 'insertText', data: answer
     }));
     input.dispatchEvent(new Event('change', {bubbles: true}));
 
-    if (input.value !== entry.answer) {
+    if (input.value !== answer) {
       setStatus('Exam: answer input failed');
       return;
     }
@@ -11841,10 +12262,11 @@
     const inputPrototype = input instanceof HTMLTextAreaElement
       ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
     const setter = Object.getOwnPropertyDescriptor(inputPrototype, 'value')?.set;
-    if (setter) setter.call(input, entry.text);
-    else input.value = entry.text;
+    const answer = humanizeLongAnswer(entry.text);
+    if (setter) setter.call(input, answer);
+    else input.value = answer;
     input.dispatchEvent(new InputEvent('input', {
-      bubbles: true, inputType: 'insertText', data: entry.text
+      bubbles: true, inputType: 'insertText', data: answer
     }));
     input.dispatchEvent(new Event('change', {bubbles: true}));
     input.dispatchEvent(new KeyboardEvent('keyup', {bubbles: true, key: 'a'}));
@@ -12141,12 +12563,18 @@
   }
 
   async function translateWithLibre(text, targetLang) {
-    if (state.mode !== 'exam-interpret' && !isInterpretRoute()) {
+    if (state.mode !== 'exam-interpret' && state.mode !== 'wordpop-listening' && !isInterpretRoute()) {
       return null;
     }
 
     const primaryUrl = CONFIG.libreTranslateUrl || 'https://libretranslate.com/translate';
     const apiKey = CONFIG.libreTranslateApiKey || '';
+    const timedFetch = async (url, options) => {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 3500);
+      try { return await fetch(url, {...(options || {}), signal: controller.signal}); }
+      finally { clearTimeout(timer); }
+    };
 
     // Primary: requested https://libretranslate.com/translate endpoint
     try {
@@ -12158,7 +12586,7 @@
       };
       if (apiKey) payload.api_key = apiKey;
 
-      const res = await fetch(primaryUrl, {
+      const res = await timedFetch(primaryUrl, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -12180,7 +12608,7 @@
 
     // Fallback 1: Public LibreTranslate instance (Argos OpenTech)
     try {
-      const res = await fetch('https://translate.argosopentech.com/translate', {
+      const res = await timedFetch('https://translate.argosopentech.com/translate', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -12208,7 +12636,7 @@
       const q = encodeURIComponent(text);
       const tl = encodeURIComponent(targetLang || 'en');
       const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=${tl}&dt=t&q=${q}`;
-      const res = await fetch(url);
+      const res = await timedFetch(url);
       if (res.ok) {
         const data = await res.json();
         if (Array.isArray(data) && Array.isArray(data[0])) {
@@ -12224,7 +12652,7 @@
     try {
       const q = encodeURIComponent(text.slice(0, 500));
       const tl = encodeURIComponent(targetLang || 'en');
-      const res = await fetch(`https://api.mymemory.translated.net/get?q=${q}&langpair=autodetect|${tl}`);
+      const res = await timedFetch(`https://api.mymemory.translated.net/get?q=${q}&langpair=autodetect|${tl}`);
       if (res.ok) {
         const data = await res.json();
         if (data && data.responseData && data.responseData.translatedText) {
@@ -12337,6 +12765,7 @@
         await sleep(1500);
         return;
       }
+      translatedText = humanizeLongAnswer(translatedText);
       state.interpretCache.set(promptSig, translatedText);
     }
 
@@ -12498,9 +12927,725 @@
     return true;
   }
 
+  // ============ FULL AUTO PILOT ============
+  function persistPilotState() {
+    saveStringSetting('pilotHomeworkUid', state.pilotHomeworkUid);
+    saveStringSetting('pilotTaskIndex', state.pilotTaskIndex);
+    saveStringSetting('pilotAssignmentUid', state.pilotAssignmentUid);
+    saveStringSetting('pilotTaskIndexUid', state.pilotTaskIndexUid);
+    saveStringSetting('pilotTaskText', state.pilotTaskText);
+    saveStringSetting('pilotGameName', state.pilotGameName);
+    saveBoolSetting('pilotAwaitingGame', state.pilotAwaitingGame);
+    saveBoolSetting('pilotInGame', state.pilotInGame);
+    saveBoolSetting('pilotFinished', state.pilotFinished);
+    saveBoolSetting('pilotFinishingTask', state.pilotFinishingTask);
+    saveBoolSetting('pilotDoingPrerequisite', state.pilotDoingPrerequisite);
+    saveStringSetting('pilotCatalogHash', state.pilotCatalogHash);
+    saveStringSetting('pilotCompletionSignal', state.pilotCompletionSignal);
+    saveStringSetting('pilotCompletionAt', state.pilotCompletionAt);
+    saveStringSetting('pilotContinueAt', state.pilotContinueAt);
+    saveStringSetting('pilotCompletedHomeworkIds', JSON.stringify([...state.pilotCompletedHomeworkIds]));
+  }
+
+  function pilotRoute() {
+    const match = String(location.hash || '').match(/^#\/([^?/#]+)/);
+    return match ? match[1].toLowerCase() : '';
+  }
+
+  function pilotHomeworkUidFromUrl() {
+    const source = `${String(location.hash || '')}&${String(location.search || '').replace(/^\?/, '')}`;
+    const match = source.match(/[?&]homeworkUid=([^&#]+)/i);
+    if (!match) return '';
+    try { return decodeURIComponent(match[1]); } catch (_) { return match[1]; }
+  }
+
+  function pilotNavHash(route, uid) {
+    return uid
+      ? `#/${route}?homeworkUid=${encodeURIComponent(uid)}`
+      : `#/${route}`;
+  }
+
+  function pilotTextWithin(root) {
+    const texts = [];
+    walk(root, obj => {
+      if (typeof obj.text === 'string' && obj.text.trim()) texts.push(obj.text.trim());
+    });
+    return texts.join(' ');
+  }
+
+  function pilotClickableObject(obj) {
+    let current = obj;
+    const stage = state.pixiApp && state.pixiApp.stage;
+    while (current && current !== stage) {
+      const events = verbEventNames(current);
+      if (current.buttonMode || current.cursor === 'pointer' ||
+          events.some(name => /^(?:pointerup|click|tap|keyup)$/i.test(name))) return current;
+      current = current.parent;
+    }
+    return obj;
+  }
+
+  async function pilotClickObject(obj) {
+    if (!obj) return false;
+    const target = pilotClickableObject(obj);
+    const events = verbEventNames(target);
+    if (events.some(name => /^pointerup$/i.test(name)) &&
+        emitOnObject(target, 'pointerup')) return true;
+    return clickTile(target);
+  }
+
+  async function pilotRunStep(step, action, label) {
+    if (state.pilotBlockedStep) {
+      setStatus(`Full auto blocked at ${state.pilotBlockedStep}; turn Full auto off/on to retry`);
+      return true;
+    }
+    if (state.pilotRouteStep !== step) {
+      state.pilotRouteStep = step;
+      state.pilotRouteAttempts = 0;
+      state.pilotLastActionAt = 0;
+    }
+    if (Date.now() - state.pilotLastActionAt < 1100) {
+      setStatus(`Full auto: ${label || step}…`);
+      return true;
+    }
+    if (state.pilotRouteAttempts >= 12) {
+      state.pilotBlockedStep = step;
+      const message = `Full auto could not confirm ${label || step} after 12 tries`;
+      addLog(message, 'err');
+      showToast(message, 'err');
+      notifyDiscord('Full auto needs help', message);
+      setStatus(message);
+      return true;
+    }
+    state.pilotLastActionAt = Date.now();
+    state.pilotRouteAttempts++;
+    let clicked = false;
+    try { clicked = !!(await action()); } catch (error) {
+      log('Full auto action failed', step, error);
+    }
+    setStatus(clicked
+      ? `Full auto: ${label || step} — waiting for page`
+      : `Full auto: retrying ${label || step} (${state.pilotRouteAttempts}/12)`);
+    return true;
+  }
+
+  function pilotFindTextObject(root, pattern) {
+    let found = null;
+    walk(root, obj => {
+      if (found || typeof obj.text !== 'string') return;
+      pattern.lastIndex = 0;
+      if (!pattern.test(obj.text.trim()) || !isVisible(obj, state.pixiApp.stage)) return;
+      const bounds = boundsOf(obj);
+      if (!bounds || bounds.width <= 0 || bounds.height <= 0) return;
+      found = obj;
+    });
+    return found;
+  }
+
+  function pilotCatalogSelectedTab() {
+    const stage = state.pixiApp && state.pixiApp.stage;
+    if (!stage) return '';
+    const tabs = [
+      {label: 'learn', pattern: /^Learn$/i},
+      {label: 'practice', pattern: /^Practice$/i},
+      {label: 'quiz', pattern: /^Quiz$/i}
+    ];
+    for (const tab of tabs) {
+      const text = pilotFindTextObject(stage, tab.pattern);
+      if (!text) continue;
+      // The background texture is a sibling of the text inside the tab
+      // composite. Reading only the interactive text misses selectedTestButton.
+      const target = text.parent || pilotClickableObject(text);
+      let selected = false;
+      walk(target, obj => {
+        const texture = `${fullTextureName(obj)} ${String(obj.name || '')}`;
+        if (/selected/i.test(texture)) selected = true;
+      });
+      if (selected) return tab.label;
+    }
+    return '';
+  }
+
+  async function pilotClickCatalogTab(labelText) {
+    const stage = state.pixiApp && state.pixiApp.stage;
+    const label = stage && pilotFindTextObject(stage, labelText === 'Practice' ? /^Practice$/i : /^Quiz$/i);
+    const tab = label && label.parent;
+    const bounds = tab && boundsOf(tab);
+    if (!tab || !bounds || !pilotOnCanvas(bounds)) return false;
+    // The text can itself be interactive without an activation handler. Aim
+    // at the tab background, just right of the text, through the real canvas.
+    const textBounds = boundsOf(label);
+    const x = textBounds
+      ? Math.min(bounds.x + bounds.width - 15, textBounds.x + textBounds.width + 18)
+      : bounds.x + bounds.width * 0.72;
+    const y = bounds.y + bounds.height / 2;
+    const clicked = await safeCanvasPointerClickWorld(x, y, '#4ade80', 180);
+    const wanted = labelText.toLowerCase();
+    if (pilotCatalogSelectedTab() === wanted) return true;
+    if (verbEventNames(tab).includes('pointerup')) {
+      emitOnObject(tab, 'pointerup', {x, y});
+      await sleep(180);
+    }
+    return clicked || pilotCatalogSelectedTab() === wanted;
+  }
+
+  function pilotClickQuizTab() { return pilotClickCatalogTab('Quiz'); }
+
+  function pilotOnCanvas(bounds) {
+    if (!bounds || !state.pixiApp) return false;
+    const resolution = Number(state.pixiApp.renderer && state.pixiApp.renderer.resolution) || 1;
+    const width = (state.pixiApp.renderer.width || state.pixiApp.view.width) / resolution;
+    const height = (state.pixiApp.renderer.height || state.pixiApp.view.height) / resolution;
+    return bounds.x + bounds.width > 0 && bounds.y + bounds.height > 0 &&
+      bounds.x < width && bounds.y < height;
+  }
+
+  function pilotHomeworkCards() {
+    const stage = state.pixiApp && state.pixiApp.stage;
+    if (!stage) return {panel: null, list: null, cards: []};
+    let panel = null;
+    walk(stage, obj => { if (!panel && obj.name === 'homework' && obj.children?.length) panel = obj; });
+    const list = panel && panel.children ? panel.children[3] : null;
+    const cards = [];
+    if (list) walk(list, obj => {
+      if (!/^assignment-\d+$/i.test(String(obj.name || '')) ||
+          !isVisible(obj, stage) || !pilotOnCanvas(boundsOf(obj))) return;
+      cards.push({obj, uid: String(obj.name).replace(/^assignment-/i, ''), title: pilotTextWithin(obj)});
+    });
+    return {panel, list, cards};
+  }
+
+  function pilotTaskRows() {
+    const stage = state.pixiApp && state.pixiApp.stage;
+    if (!stage) return [];
+    const rows = [];
+    walk(stage, obj => {
+      if (obj.name !== 'task-card' || !isVisible(obj, stage) ||
+          !pilotOnCanvas(boundsOf(obj))) return;
+      const labels = [];
+      walk(obj, child => {
+        if (typeof child.text === 'string' && child.text.trim()) labels.push(child.text.trim());
+      });
+      const title = labels.find(text => /^\s*\d+\.\s*\S/.test(text));
+      const match = title && title.match(/^\s*(\d+)\.\s*(.+?)\s*$/);
+      if (match) {
+        const siblings = obj.parent?.children || [];
+        const score = siblings[siblings.indexOf(obj) + 1];
+        const scoreText = score && score.name === 'score-button' ? pilotTextWithin(score) : '';
+        const completed = /^100\s*%$/.test(scoreText.trim());
+        rows.push({obj, number: Number(match[1]), text: `${match[1]}. ${match[2]}`, completed});
+      }
+    });
+    return rows.sort((a, b) => a.number - b.number);
+  }
+
+  function pilotGameTile(gameName, allowHidden) {
+    const stage = state.pixiApp && state.pixiApp.stage;
+    if (!stage) return null;
+    const wanted = normaliseText(gameName);
+    if (!wanted) return null;
+    const matches = [];
+    walk(stage, obj => {
+      if (typeof obj.text !== 'string') return;
+      const label = obj.text.trim();
+      if (normaliseText(label) !== wanted) return;
+      const target = pilotClickableObject(obj);
+      const bounds = boundsOf(target) || boundsOf(obj);
+      if (!bounds || bounds.width <= 0 || bounds.height <= 0 ||
+          bounds.width > 420 || bounds.height > 240 || bounds.y < 175) return;
+      const visible = isVisible(target, stage) && pilotOnCanvas(bounds);
+      if (!visible && !allowHidden) return;
+      // Hidden catalog cards are only considered after checking all visible
+      // tabs, and only when their PIXI ancestor is an actual click target.
+      if (!visible && !verbEventNames(target).some(name => /^pointerup$/i.test(name))) return;
+      matches.push({obj: target, label, bounds, visible});
+    });
+    matches.sort((a, b) => Number(b.visible) - Number(a.visible));
+    return matches[0] || null;
+  }
+
+  function pilotQuizSkill() {
+    const parts = String(state.pilotTaskText || '').split(/\s*→\s*/).map(x => x.trim());
+    const fromTask = parts.length >= 2 ? parts[parts.length - 2] : '';
+    if (/^(?:reading|listening|writing|speaking)$/i.test(fromTask)) return fromTask;
+    const params = new URLSearchParams(String(location.hash || '').split('?')[1] || '');
+    const fromRoute = params.get('gameType') || params.get('type') || '';
+    return /^(?:reading|listening|writing|speaking)$/i.test(fromRoute) ? fromRoute : '';
+  }
+
+  function pilotPracticeTile() {
+    const choices = [state.pilotGameName, 'Word Pop', 'Multiple Choice',
+      'Avocado Smash', 'WordPod', 'Skyrise', 'Jumble'].filter(Boolean);
+    for (const name of choices) {
+      const tile = pilotGameTile(name);
+      if (tile) return tile;
+    }
+    return null;
+  }
+
+  function pilotQuizTile(skill) {
+    const stage = state.pixiApp && state.pixiApp.stage;
+    if (!stage || !skill) return null;
+    const wanted = normaliseText(skill);
+    let best = null;
+    walk(stage, obj => {
+      if (typeof obj.text !== 'string' || !isVisible(obj, stage)) return;
+      const label = normaliseText(obj.text);
+      if (label !== wanted && label !== `${wanted} quiz` && label !== `${wanted} test`) return;
+      const target = pilotClickableObject(obj);
+      const bounds = boundsOf(target) || boundsOf(obj);
+      if (!bounds || bounds.width <= 0 || bounds.height <= 0 ||
+          bounds.width > 420 || bounds.height > 240 || !pilotOnCanvas(bounds)) return;
+      // The dumped Quiz card is an interactive parent of its Reading text,
+      // with testListBackground.png as a child. This also proves that the
+      // Quiz pane is open when the selected tab sprite cannot be identified.
+      if (bounds.y < 175 || !verbEventNames(target).some(name => /^pointerup$/i.test(name))) return;
+      let isQuizCard = false;
+      walk(target, child => {
+        if (/testListBackground/i.test(`${fullTextureName(child)} ${String(child.texture?.baseTexture?.resource?.url || '')}`))
+          isQuizCard = true;
+      });
+      if (!isQuizCard) return;
+      if (!best || bounds.width * bounds.height > best.bounds.width * best.bounds.height)
+        best = {obj: target, label: obj.text.trim(), bounds};
+    });
+    return best;
+  }
+
+  async function pilotClickQuizTile(tile) {
+    const b = tile && tile.bounds;
+    if (!b) return false;
+    // Aim inside the card where the user's successful click landed. A real
+    // canvas pointer sequence reaches the PIXI parent's pointerup handler.
+    return safeCanvasPointerClickWorld(
+      b.x + b.width * 0.35, b.y + b.height * 0.62, '#4ade80', 160);
+  }
+
+  function pilotClearTaskFlags() {
+    state.pilotAwaitingGame = false;
+    state.pilotInGame = false;
+    state.pilotFinishingTask = false;
+    state.pilotDoingPrerequisite = false;
+    state.pilotCatalogHash = '';
+    state.pilotCompletionSignal = '';
+    state.pilotCompletionAt = 0;
+    state.pilotContinueAt = 0;
+    state.pilotTaskText = '';
+    state.pilotTaskIndexUid = '';
+    state.pilotGameName = '';
+    state.pilotCatalogTabIndex = 0;
+    state.pilotCatalogTabAt = 0;
+    state.pilotCatalogQuizSelected = false;
+    persistPilotState();
+  }
+
+  function pilotAdvanceTask() {
+    const rowNumber = Number((state.pilotTaskText || '').match(/^\s*(\d+)\./)?.[1]) ||
+      state.pilotTaskIndex + 1;
+    state.pilotTaskIndex = Math.max(state.pilotTaskIndex + 1, rowNumber);
+    state.pilotBlockedStep = '';
+    state.pilotRouteStep = '';
+    state.pilotRouteAttempts = 0;
+    addLog(`✓ Full auto completed task ${rowNumber}`, 'ok');
+    if (state.mode === 'mc2-reading' || state.mode === 'mc2-listening') resetMC2State();
+    notifyDiscord('Homework task completed', `Task ${rowNumber}: ${state.pilotTaskText || state.pilotGameName || 'activity'}`);
+    pilotClearTaskFlags();
+    state.pilotRouteStep = '';
+    state.pilotRouteAttempts = 0;
+    persistPilotState();
+  }
+
+  function pilotFinishAssignment() {
+    const uid = String(state.pilotHomeworkUid || pilotHomeworkUidFromUrl() || '');
+    if (uid) state.pilotCompletedHomeworkIds.add(uid);
+    addLog(`✓ Full auto finished homework${uid ? ` ${uid}` : ''}`, 'ok');
+    const summary = `Homework ${uid || 'assignment'}: ${formatDuration(pilotElapsedSeconds())} real, ${formatDuration(state.pilotFakeSeconds)} simulated`;
+    addLog(summary, 'ok');
+    showToast(summary, 'ok');
+    notifyDiscord('Homework completed', summary);
+    state.pilotElapsedMs += state.pilotStartedAt ? Date.now() - state.pilotStartedAt : 0;
+    state.pilotStartedAt = 0;
+    saveStringSetting('pilotElapsedMs', state.pilotElapsedMs);
+    state.pilotHomeworkUid = '';
+    state.pilotAssignmentUid = '';
+    state.pilotTaskIndex = 0;
+    state.pilotFinished = false;
+    pilotClearTaskFlags();
+    state.pilotRouteStep = '';
+    state.pilotRouteAttempts = 0;
+    persistPilotState();
+    location.hash = pilotNavHash('Homework');
+  }
+
+  async function autopilotTick(activeMode) {
+    if (!state.autopilot) return false;
+    // Concert has a separate navigation firewall and lifecycle; the homework
+    // pilot must never take ownership of that route.
+    if (isConcertRoute() || concertNavigationLocked()) return false;
+    const route = pilotRoute();
+    if (state.pilotFinished) {
+      if (route === 'dashboard' || !route) {
+        location.hash = pilotNavHash('Homework');
+        return true;
+      }
+      if (route === 'homework' && pilotHomeworkCards().cards.some(card =>
+        !state.pilotCompletedHomeworkIds.has(card.uid))) {
+        state.pilotFinished = false;
+        persistPilotState();
+      } else {
+        setStatus('Full auto: finished — no current assignments left');
+        return true;
+      }
+    }
+    const uidFromRoute = pilotHomeworkUidFromUrl();
+    if (route === 'homeworkdetail' && uidFromRoute &&
+        uidFromRoute !== state.pilotHomeworkUid && !state.pilotFinishingTask) {
+      state.pilotHomeworkUid = uidFromRoute;
+      state.pilotAssignmentUid = uidFromRoute;
+      state.pilotTaskIndex = 0;
+      state.pilotRouteStep = '';
+      state.pilotRouteAttempts = 0;
+      persistPilotState();
+    }
+
+    if (state.pilotDoingPrerequisite &&
+        (state.pilotFinishingTask || (state.pilotInGame && !state.pilotAwaitingGame)) &&
+        (route === 'catalog' || route === 'homeworkdetail' || route === 'homework')) {
+      if (route !== 'catalog' && state.pilotCatalogHash) {
+        location.hash = state.pilotCatalogHash;
+        setStatus('Full auto: returning to Quiz after required Practice');
+        return true;
+      }
+      state.pilotFinishingTask = false;
+      state.pilotInGame = false;
+      state.pilotAwaitingGame = false;
+      state.pilotDoingPrerequisite = false;
+      state.pilotCatalogHash = '';
+      state.pilotRouteStep = '';
+      state.pilotRouteAttempts = 0;
+      persistPilotState();
+      setStatus('Full auto: required Practice complete; reopening Quiz');
+      return true;
+    }
+
+    // A completed task may return to the Catalog or task list before the
+    // completion overlay has fully disappeared. Treat either as the hand-off.
+    if ((route === 'homeworkdetail' || route === 'homework' || route === 'catalog') &&
+        (state.pilotFinishingTask || (state.pilotInGame && !state.pilotAwaitingGame))) {
+      if (route === 'homeworkdetail') {
+        const row = pilotTaskRows().find(item =>
+          String(item.number) === String(state.pilotTaskIndexUid));
+        if (state.pilotFinishingTask || (row && row.completed)) {
+          pilotAdvanceTask();
+          return true;
+        }
+        if (!state.pilotCompletionAt) state.pilotCompletionAt = Date.now();
+        if (Date.now() - state.pilotCompletionAt < 2500) {
+          setStatus('Full auto: checking task score before moving on');
+          return true;
+        }
+        state.pilotInGame = false;
+        state.pilotAwaitingGame = true;
+        state.pilotCompletionAt = 0;
+        state.pilotRouteStep = '';
+        persistPilotState();
+        setStatus('Full auto: task is incomplete; reopening it');
+        return true;
+      }
+      if (route === 'catalog') {
+        if (state.pilotFinishingTask) pilotAdvanceTask();
+        location.hash = pilotNavHash('HomeworkDetail', state.pilotHomeworkUid);
+        return true;
+      }
+      if (route === 'homework') {
+        const uid = String(state.pilotHomeworkUid || '');
+        if (uid) {
+          if (state.pilotFinishingTask) pilotAdvanceTask();
+          location.hash = pilotNavHash('HomeworkDetail', uid);
+        } else {
+          state.pilotInGame = false;
+          state.pilotFinishingTask = false;
+          persistPilotState();
+        }
+        return true;
+      }
+    }
+
+    if (route === 'dashboard' || !route) {
+      return pilotRunStep('dashboard-homework', async () => {
+        location.hash = pilotNavHash('Homework');
+        return true;
+      }, 'open Homework');
+    }
+
+    if (route === 'homework') {
+      if (state.pilotBlockedStep) {
+        setStatus(`Full auto blocked at ${state.pilotBlockedStep}; turn Full auto off/on to retry`);
+        return true;
+      }
+      const {list, cards} = pilotHomeworkCards();
+      if (state.pilotHomeworkUid && state.pilotCompletedHomeworkIds.has(String(state.pilotHomeworkUid))) {
+        state.pilotHomeworkUid = '';
+        state.pilotAssignmentUid = '';
+        state.pilotTaskIndex = 0;
+        pilotClearTaskFlags();
+        persistPilotState();
+      }
+      const preferred = state.pilotHomeworkUid
+        ? cards.find(card => card.uid === String(state.pilotHomeworkUid)) : null;
+      const nextCard = preferred || cards.find(card =>
+        !state.pilotCompletedHomeworkIds.has(card.uid));
+      if (nextCard) {
+        if (nextCard.uid !== state.pilotHomeworkUid) {
+          state.pilotElapsedMs = 0;
+          state.pilotFakeSeconds = 0;
+          state.pilotStartedAt = Date.now();
+          saveStringSetting('pilotElapsedMs', '0');
+          saveStringSetting('pilotFakeSeconds', '0');
+          state.pilotHomeworkUid = nextCard.uid;
+          state.pilotAssignmentUid = nextCard.uid;
+          state.pilotTaskIndex = 0;
+          state.pilotRouteStep = '';
+          state.pilotRouteAttempts = 0;
+          pilotClearTaskFlags();
+          persistPilotState();
+        }
+        return pilotRunStep(`homework-card-${nextCard.uid}`, () =>
+          pilotClickObject(nextCard.obj), `open assignment ${nextCard.title.slice(0, 42)}`);
+      }
+      if (list && !isVisible(list, state.pixiApp.stage)) {
+        const tab = pilotFindTextObject(state.pixiApp.stage, /^Current Assignments\s*:?/i);
+        if (tab) return pilotRunStep('homework-current-tab', () =>
+          pilotClickObject(tab), 'show current assignments');
+      }
+      const currentTab = pilotFindTextObject(state.pixiApp.stage, /^Current Assignments\s*:?\s*0\b/i);
+      if (currentTab || (cards.length && cards.every(card =>
+          state.pilotCompletedHomeworkIds.has(card.uid)))) {
+        state.pilotFinished = true;
+        persistPilotState();
+        setStatus('Full auto: no current assignments left');
+        addLog('Full auto: no current assignments left', 'ok');
+        notifyDiscord('Full auto finished', 'No current assignments left');
+        return true;
+      }
+      return pilotRunStep('homework-current-tab', async () => false,
+        'find a current assignment');
+    }
+
+    if (route === 'homeworkdetail') {
+      const rows = pilotTaskRows();
+      if (state.pilotAwaitingGame && !state.pilotInGame) {
+        const pending = rows.find(row => String(row.number) === state.pilotTaskIndexUid);
+        if (pending) {
+          const signature = `${pending.number}::${pending.text}`;
+          if (!state.pilotTaskText || state.pilotTaskText === pending.text) {
+            state.pilotTaskText = pending.text;
+            const parts = pending.text.split(/\s*→\s*/).map(part => part.trim()).filter(Boolean);
+            state.pilotGameName = parts[parts.length - 1] || state.pilotGameName;
+            persistPilotState();
+            return pilotRunStep(`homework-task-${pending.number}`, () =>
+              pilotClickObject(pending.obj), `reopen task ${pending.number}${state.pilotGameName ? ` (${state.pilotGameName})` : ''}`);
+          }
+          log('Full auto pending task changed, repairing saved selection', signature);
+        }
+      }
+      if (!rows.length) return pilotRunStep('homework-task-rows', async () => false,
+        'load numbered tasks');
+      // The score beside each task is the server's completion state. A saved
+      // index can lag behind if the user completed a task outside this script.
+      let nextRow = rows.find(row => !row.completed && row.number > state.pilotTaskIndex);
+      if (!nextRow) nextRow = rows.find(row => !row.completed);
+      if (!nextRow) {
+        pilotFinishAssignment();
+        return true;
+      }
+      state.pilotTaskIndex = nextRow.number - 1;
+      const parts = nextRow.text.split(/\s*→\s*/).map(part => part.trim()).filter(Boolean);
+      const gameName = parts.length ? parts[parts.length - 1] : '';
+      state.pilotTaskText = nextRow.text;
+      state.pilotTaskIndexUid = String(nextRow.number);
+      state.pilotBlockedStep = '';
+      state.pilotGameName = gameName;
+      state.pilotAwaitingGame = true;
+      state.pilotInGame = false;
+      state.pilotCatalogTabIndex = 0;
+      state.pilotCatalogQuizSelected = false;
+      persistPilotState();
+      return pilotRunStep(`homework-task-${nextRow.number}`, () =>
+        pilotClickObject(nextRow.obj), `open task ${nextRow.number}${gameName ? ` (${gameName})` : ''}`);
+    }
+
+    if (route === 'catalog') {
+      if (state.pilotBlockedStep) {
+        setStatus(`Full auto blocked at ${state.pilotBlockedStep}; turn Full auto off/on to retry`);
+        return true;
+      }
+      if (state.pilotInGame && !state.pilotAwaitingGame) {
+        pilotAdvanceTask();
+        location.hash = pilotNavHash('HomeworkDetail', state.pilotHomeworkUid);
+        return true;
+      }
+      const practiceLock = pilotFindTextObject(state.pixiApp.stage,
+        /You still need to complete\s+\d+\s+more practice activit/i);
+      if (practiceLock || state.pilotDoingPrerequisite) {
+        if (!state.pilotDoingPrerequisite) {
+          state.pilotDoingPrerequisite = true;
+          state.pilotCatalogHash = location.hash;
+          addLog('Quiz requires a Practice activity first; completing it now', 'ok');
+          persistPilotState();
+        }
+        if (pilotCatalogSelectedTab() !== 'practice')
+          return pilotRunStep('catalog-practice-tab', () =>
+            pilotClickCatalogTab('Practice'), 'open required Practice');
+        const practiceTile = pilotPracticeTile();
+        if (!practiceTile) return pilotRunStep('catalog-practice-tile', async () => false,
+          'find a required Practice activity');
+        state.pilotAwaitingGame = true;
+        persistPilotState();
+        return pilotRunStep(`catalog-practice-${normaliseText(practiceTile.label)}`, () =>
+          pilotClickQuizTile(practiceTile), `start required ${practiceTile.label} Practice`);
+      }
+      // The visible TestList card is stronger evidence than a tab sprite:
+      // selectedTestButton may have a generated PIXI texture id.
+      const skill = pilotQuizSkill();
+      const tile = pilotQuizTile(skill);
+      if (tile) {
+        state.pilotCatalogQuizSelected = true;
+        state.pilotAwaitingGame = true;
+        state.pilotInGame = false;
+        persistPilotState();
+        return pilotRunStep(`catalog-quiz-${normaliseText(tile.label)}`, () =>
+          pilotClickQuizTile(tile), `start ${tile.label} Quiz`);
+      }
+      // Always target Quiz directly for assigned tasks; never cycle through
+      // Practice. Learn/Practice expose selected*Button textures, while the
+      // unselected Quiz button itself can also be named testButton.png.
+      const selectedTab = pilotCatalogSelectedTab();
+      if (selectedTab !== 'quiz') {
+        state.pilotCatalogQuizSelected = false;
+        const quiz = pilotFindTextObject(state.pixiApp.stage, /^Quiz$/i);
+        if (!quiz) return pilotRunStep('catalog-quiz-tab', async () => false, 'find Quiz tab');
+        // Keep clicking/retrying only the Quiz tab until its selected texture
+        // confirms the mode switch. Never fall through to Learn/Practice tiles.
+        return pilotRunStep('catalog-quiz-tab', pilotClickQuizTab, 'open Quiz');
+      }
+      state.pilotCatalogQuizSelected = true;
+      persistPilotState();
+      const fallbackTile = !skill && pilotGameTile(state.pilotGameName);
+      if (fallbackTile) {
+        state.pilotAwaitingGame = true;
+        state.pilotInGame = false;
+        persistPilotState();
+        return pilotRunStep(`catalog-quiz-${normaliseText(fallbackTile.label)}`, () =>
+          pilotClickQuizTile(fallbackTile), `start ${fallbackTile.label} Quiz`);
+      }
+      return pilotRunStep('catalog-game-tile', async () => false,
+        skill ? `find ${skill} Quiz card` : 'find the assigned Quiz card');
+    }
+
+    const isNavRoute = ['dashboard', 'homework', 'homeworkdetail', 'catalog'].includes(route);
+    if (!isNavRoute && !state.pilotAwaitingGame && !state.pilotInGame &&
+        !state.pilotHomeworkUid && !state.pilotTaskText) return false;
+    if (!isNavRoute && state.pilotAwaitingGame && !activeMode) {
+      setStatus(`Full auto: waiting for ${state.pilotGameName || 'activity'} to load`);
+      return true;
+    }
+    if (!isNavRoute && (state.pilotAwaitingGame || activeMode || state.pilotInGame)) {
+      if (state.pilotAwaitingGame) {
+        state.pilotAwaitingGame = false;
+        state.pilotInGame = true;
+        state.pilotFinishingTask = false;
+        state.pilotCompletionSignal = '';
+        state.pilotCompletionAt = 0;
+        state.pilotContinueAt = 0;
+        state.pilotRouteStep = '';
+        state.pilotRouteAttempts = 0;
+        persistPilotState();
+        addLog(`▶ Full auto playing ${state.pilotGameName || modeLabel(activeMode)}`, 'ok');
+      }
+      if (!state.pilotInGame && activeMode) {
+        // If Full auto is enabled on an already-open game, finish that game
+        // before returning to the assignment list.
+        state.pilotInGame = true;
+        persistPilotState();
+      }
+      if (state.pilotFinishingTask) {
+        const elapsed = Date.now() - (state.pilotCompletionAt || 0);
+        if (state.pilotContinueAt) {
+          if (Date.now() - state.pilotContinueAt < 1600) {
+            setStatus('Full auto: waiting for game completion hand-off');
+            return true;
+          }
+          if (state.pilotHomeworkUid) {
+            location.hash = state.pilotDoingPrerequisite && state.pilotCatalogHash
+              ? state.pilotCatalogHash : pilotNavHash('HomeworkDetail', state.pilotHomeworkUid);
+            setStatus('Full auto: returning to numbered tasks');
+            return true;
+          }
+        } else if (elapsed < 2600) {
+          const clicked = await clickVisibleContinue();
+          if (clicked) {
+            state.pilotContinueAt = Date.now();
+            persistPilotState();
+            setStatus('Full auto: continuing from completed game');
+            return true;
+          }
+          setStatus('Full auto: waiting for completion control');
+          return true;
+        } else if (state.pilotHomeworkUid) {
+          location.hash = state.pilotDoingPrerequisite && state.pilotCatalogHash
+            ? state.pilotCatalogHash : pilotNavHash('HomeworkDetail', state.pilotHomeworkUid);
+          setStatus('Full auto: returning to numbered tasks');
+          return true;
+        }
+      }
+      // Let MC2 record the result before a Continue click can clear the
+      // result sprites or replace the current question.
+      if ((activeMode === 'mc2-reading' && state.mc2ReadingPending) ||
+          (activeMode === 'mc2-listening' && state.mc2PendingKey)) return false;
+      const completionCandidate = detectCompletion();
+      const continueAvailable = !!(completionCandidate && continueControls().length);
+      const explicitCompletion = !!(completionCandidate &&
+        /^(?:url:results|.*\b(?:quiz|activity|homework|exercise)\s+(?:is\s+)?(?:complete|completed|finished|done)\b|.*\ball\s+(?:correct|right)\b)/i.test(completionCandidate));
+      const done = completionCandidate && (continueAvailable || explicitCompletion)
+        ? completionCandidate : null;
+      if (done) {
+        if (!state.pilotFinishingTask) {
+          const completionLabel = done;
+          state.pilotFinishingTask = true;
+          state.pilotCompletionSignal = completionLabel;
+          state.pilotCompletionAt = Date.now();
+          state.pilotContinueAt = 0;
+          persistPilotState();
+          addLog(`✓ Full auto detected completed game: ${completionLabel}`, 'ok');
+          notifyDiscord('Game completed', `${state.pilotGameName || modeLabel(activeMode)}: ${completionLabel}`);
+        }
+        const clicked = await clickVisibleContinue();
+        if (clicked) {
+          state.pilotContinueAt = Date.now();
+          persistPilotState();
+          setStatus('Full auto: continuing from completed game');
+        } else if (Date.now() - state.pilotCompletionAt >= 2600) {
+          if (state.pilotHomeworkUid) location.hash = state.pilotDoingPrerequisite && state.pilotCatalogHash
+            ? state.pilotCatalogHash : pilotNavHash('HomeworkDetail', state.pilotHomeworkUid);
+          setStatus('Full auto: returning to numbered tasks');
+        } else setStatus('Full auto: waiting for completion hand-off');
+        return true;
+      }
+      return false;
+    }
+
+    if (!isNavRoute && !activeMode && state.pilotInGame) {
+      setStatus('Full auto: waiting for activity or completion');
+      return true;
+    }
+    return false;
+  }
+
   // ============ MAIN ============
   async function tick() {
     if (!state.running) return;
+    refreshPilotTimer();
     if (!tryGrabPixi()) { setStatus('Waiting for Pixi…'); return; }
     applyUserOptions();
     hookServicesFakeTime();
@@ -12600,8 +13745,21 @@
       updateModeButtons(m);
     }
 
+    // The route pilot owns only navigation/completion hand-offs. On an activity
+    // route it returns control to the existing per-game solver.
+    if (state.autopilot && await autopilotTick(detectedMode)) return;
+
     // Dismiss any start dialog immediately whenever visible across all games & exams
     if (await dismissStartDialog()) return;
+
+    if (m === 'mc2-reading' && state.mc2ReadingPending) {
+      await mc2ReadingTick();
+      return;
+    }
+    if (m === 'mc2-listening' && state.mc2PendingKey) {
+      await mc2ListeningTick();
+      return;
+    }
 
     // A visible Continue control takes priority over the completion screen and
     // over a stale question still visible behind a result overlay.
@@ -12759,6 +13917,22 @@
       return;
     }
 
+    if (m === 'skyrise') {
+      if (state.skyRiseBusy) return;
+      state.skyRiseBusy = true;
+      try {
+        await skyRiseTick();
+      } catch (e) {
+        const msg = e && e.message ? e.message : String(e);
+        addLog(`Skyrise runtime error: ${msg}`, 'err');
+        setStatus('Skyrise: runtime error');
+        log('Skyrise runtime error', e);
+      } finally {
+        state.skyRiseBusy = false;
+      }
+      return;
+    }
+
     if (m === 'wordpop-listening') {
       if (state.wordPopBusy) return;
 
@@ -12844,9 +14018,65 @@
     }
     setStatus('Unknown activity');
   }
-  async function loop() { while (state.running) { try { await tick(); } catch (e) { log('tick error', e); } await sleep(CONFIG.loopPauseMs); } }
+  async function loop() { while (state.running) { try { await tick(); } catch (e) { log('tick error', e); addLog(`Automation error: ${e && e.message ? e.message : String(e)}`, 'err'); } await sleep(CONFIG.loopPauseMs); } }
 
   // ============ UI ============
+  function applyPanelAppearance() {
+    const panel = document.getElementById('ln-ac-panel');
+    if (!panel) return;
+    const accent = /^#[0-9a-f]{6}$/i.test(state.uiAccent) ? state.uiAccent : '#4ade80';
+    panel.style.setProperty('--ln-ac-accent', accent);
+    panel.style.zoom = `${state.uiScale}%`;
+    panel.style.opacity = String(state.uiOpacity / 100);
+    panel.style.top = state.uiDock.startsWith('top') ? '20px' : 'auto';
+    panel.style.bottom = state.uiDock.startsWith('bottom') ? '20px' : 'auto';
+    panel.style.left = state.uiDock.endsWith('left') ? '20px' : 'auto';
+    panel.style.right = state.uiDock.endsWith('right') ? '20px' : 'auto';
+  }
+
+  function showFullAutoWarning(onContinue) {
+    document.getElementById('ln-ac-warning')?.remove();
+    const overlay = document.createElement('div');
+    overlay.id = 'ln-ac-warning';
+    overlay.innerHTML = '<div><h2>Full auto is experimental</h2><p>It may get stuck or choose the wrong action on an activity. Watch its progress and stop it if needed.</p><footer><button type="button" data-action="close">Close</button><button type="button" data-action="continue">Continue</button></footer></div>';
+    overlay.querySelector('[data-action="close"]').onclick = () => overlay.remove();
+    overlay.querySelector('[data-action="continue"]').onclick = () => { overlay.remove(); onContinue(); };
+    document.body.appendChild(overlay);
+  }
+
+  function panelGameAnswerInput() {
+    const visible = el => {
+      if (!el || el.closest('#ln-ac-panel')) return false;
+      const style = getComputedStyle(el);
+      const rect = el.getBoundingClientRect();
+      return style.display !== 'none' && style.visibility !== 'hidden' &&
+        Number(style.opacity) > 0 && rect.width > 20 && rect.height > 10;
+    };
+    const direct = document.getElementById('textInputChina');
+    if (visible(direct)) return direct;
+    return [...document.querySelectorAll(
+      '#languagenutViewport textarea, #languagenutViewport input[type="text"]'
+    )].find(visible) || null;
+  }
+
+  function panelPasteIntoGame(value) {
+    const input = panelGameAnswerInput();
+    if (!input || !value) return false;
+    const proto = input instanceof HTMLTextAreaElement
+      ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+    try {
+      input.focus({preventScroll: true});
+      if (setter) setter.call(input, value);
+      else input.value = value;
+      input.dispatchEvent(new Event('input', {bubbles: true}));
+      input.dispatchEvent(new Event('change', {bubbles: true}));
+      return input.value === value;
+    } catch (_) {
+      return false;
+    }
+  }
+
   function createPanel() {
     if (state.panelInjected) return true;
     if (document.getElementById('ln-ac-panel')) { state.panelInjected = true; return true; }
@@ -12854,7 +14084,7 @@
     const p = document.createElement('div');
     p.id = 'ln-ac-panel';
     p.innerHTML = `
-      <div id="ln-ac-header"><span>LN Autocompleter v12.13</span><button id="ln-ac-min">–</button></div>
+      <div id="ln-ac-header"><span>Lume Autocompleter</span><button id="ln-ac-min">–</button></div>
       <div id="ln-ac-body">
         <div id="ln-ac-status">Idle</div>
         <div class="ln-ac-stat"><span>Mode</span><span id="ln-ac-mode">—</span></div>
@@ -12864,11 +14094,20 @@
         <div class="ln-ac-stat"><span>Prompt</span><span id="ln-ac-prompt">—</span></div>
         <div class="ln-ac-stat"><span>Audio</span><span id="ln-ac-audio">—</span></div>
         <div class="ln-ac-stat"><span>Answered</span><span id="ln-ac-answered">0</span></div>
+        <div class="ln-ac-stat"><span>Real homework time</span><span id="ln-ac-real-time">0h 00m 00s</span></div>
+        <div class="ln-ac-stat"><span>Simulated time</span><span id="ln-ac-simulated-time">0h 00m 00s</span></div>
         <div id="ln-ac-progress"><div id="ln-ac-bar"><div id="ln-ac-fill"></div></div><span id="ln-ac-count">0</span></div>
         <div id="ln-ac-options">
           <label class="ln-ac-option"><input id="ln-ac-mute" type="checkbox"> Mute audio</label>
-          <label class="ln-ac-option"><input id="ln-ac-fast" type="checkbox"> Fast animations</label>
+          <label class="ln-ac-option"><input id="ln-ac-auto" type="checkbox"> Full auto</label>
+          <label class="ln-ac-option"><input id="ln-ac-humanize" type="checkbox"> Humanize writing</label>
         </div>
+        <details id="ln-ac-custom"><summary>Customize UI</summary><div>
+          <label>Accent <input id="ln-ac-accent" type="color"></label>
+          <label>Size <input id="ln-ac-scale" type="range" min="75" max="130"></label>
+          <label>Opacity <input id="ln-ac-opacity" type="range" min="70" max="100"></label>
+          <label>Corner <select id="ln-ac-dock"><option value="bottom-right">Bottom right</option><option value="top-right">Top right</option><option value="bottom-left">Bottom left</option><option value="top-left">Top left</option></select></label>
+        </div></details>
         <div id="ln-ac-fake-row">Simulated seconds/question <input id="ln-ac-fake-min" type="number" min="1" max="3600" step="1" aria-label="Minimum simulated seconds">–<input id="ln-ac-fake-max" type="number" min="1" max="3600" step="1" aria-label="Maximum simulated seconds"></div>
         <div id="ln-ac-webhook-row">
           <input id="ln-ac-webhook" type="password" autocomplete="off" spellcheck="false" placeholder="Discord webhook URL (optional)">
@@ -12879,6 +14118,11 @@
           <button id="ln-ac-reset" class="ln-ac-btn ghost">↺</button>
           <button id="ln-ac-play" class="ln-ac-btn ghost">▶</button>
           <button id="ln-ac-dump" class="ln-ac-btn ghost">?</button>
+        </div>
+        <div id="ln-ac-clipboard">
+          <input id="ln-ac-paste-text" type="text" placeholder="Paste answer text here" aria-label="Answer text to paste into game">
+          <button id="ln-ac-paste-game" type="button">Paste into game</button>
+          <button id="ln-ac-copy-log" type="button">Copy log</button>
         </div>
         <div id="ln-ac-log"></div>
       </div>`;
@@ -12906,23 +14150,93 @@
       #ln-ac-webhook-test{flex:0 0 44px;background:#191919;border:1px solid #333;border-radius:6px;color:#aaa;font-size:10px;cursor:pointer}
       #ln-ac-webhook-test:hover{color:#eee;border-color:#555}
       #ln-ac-actions{display:flex;gap:8px;margin-bottom:10px}
+      #ln-ac-clipboard{display:flex;gap:5px;margin-bottom:10px}
+      #ln-ac-paste-text{min-width:0;flex:1;background:#111;border:1px solid #333;border-radius:6px;color:#ddd;padding:6px;font-size:11px;font-family:inherit}
+      #ln-ac-clipboard button{background:#191919;border:1px solid #333;border-radius:6px;color:#ddd;padding:5px 7px;font-size:10px;font-family:inherit;cursor:pointer}
+      #ln-ac-clipboard button:hover{border-color:#777}
       .ln-ac-btn{flex:1;padding:9px 0;background:#fff;color:#0a0a0a;border:none;border-radius:7px;font-size:12px;font-weight:600;font-family:inherit;cursor:pointer;transition:opacity .15s}
       .ln-ac-btn:hover{opacity:.85}
       .ln-ac-btn.ghost{background:transparent;color:#888;border:1px solid #333;flex:0 0 40px}
       .ln-ac-btn.ghost:hover{color:#ccc;border-color:#555}
       .ln-ac-btn.active{background:#4ade80;color:#062a14}
-      #ln-ac-log{max-height:200px;overflow-y:auto;font-size:10.5px;color:#666;line-height:1.55;font-family:ui-monospace,Menlo,monospace;white-space:pre-wrap;word-break:break-word}
+      #ln-ac-log{max-height:200px;overflow-y:auto;font-size:10.5px;color:#666;line-height:1.55;font-family:ui-monospace,Menlo,monospace;white-space:pre-wrap;word-break:break-word;user-select:text}
       #ln-ac-log .ok{color:#4ade80}
       #ln-ac-log .err{color:#ff5c5c}
       #ln-ac-panel.collapsed #ln-ac-body{display:none}`;
+    s.textContent += `
+      #ln-ac-panel{--ln-ac-accent:#4ade80}
+      #ln-ac-panel .ln-ac-option input{accent-color:var(--ln-ac-accent)}
+      #ln-ac-panel .ln-ac-btn.active,#ln-ac-fill{background:var(--ln-ac-accent)}
+      #ln-ac-custom{margin:0 0 10px;color:#aaa;font-size:10.5px}
+      #ln-ac-custom summary{cursor:pointer}
+      #ln-ac-custom>div{display:flex;flex-wrap:wrap;gap:7px;margin-top:8px}
+      #ln-ac-custom label{display:flex;align-items:center;gap:4px}
+      #ln-ac-custom input[type=range]{width:65px;accent-color:var(--ln-ac-accent)}
+      #ln-ac-custom select{max-width:110px;background:#111;color:#ddd;border:1px solid #333;border-radius:5px}
+      #ln-ac-toasts{position:fixed;top:12px;right:12px;z-index:2147483647;display:flex;flex-direction:column;gap:8px;max-width:min(360px,calc(100vw - 24px));font:12px -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}
+      .ln-ac-toast{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;background:#142016;color:#eaf7ed;border:1px solid #4ade80;border-radius:9px;padding:10px 12px;box-shadow:0 8px 25px #0008}
+      .ln-ac-toast.err{background:#2a1515;border-color:#ff5c5c;color:#fff0f0}
+      .ln-ac-toast button{border:0;background:transparent;color:inherit;cursor:pointer;font-size:17px;line-height:12px}
+      #ln-ac-warning{position:fixed;inset:0;z-index:2147483647;background:#0009;display:flex;align-items:center;justify-content:center;font:13px -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}
+      #ln-ac-warning>div{width:min(390px,calc(100vw - 32px));padding:20px;background:#161616;color:#eee;border:1px solid #555;border-radius:12px;box-shadow:0 20px 60px #000b}
+      #ln-ac-warning h2{font-size:17px;margin:0 0 10px}
+      #ln-ac-warning p{line-height:1.5;color:#bbb}
+      #ln-ac-warning footer{display:flex;justify-content:flex-end;gap:8px;margin-top:18px}
+      #ln-ac-warning button{padding:8px 13px;border-radius:7px;border:1px solid #555;background:#242424;color:#eee;cursor:pointer}
+      #ln-ac-warning button:last-child{background:#4ade80;color:#08200e;border-color:#4ade80}`;
     document.head.appendChild(s); document.body.appendChild(p);
 
+    document.getElementById('ln-ac-paste-game').addEventListener('click', async () => {
+      const box = document.getElementById('ln-ac-paste-text');
+      let value = String(box?.value || '');
+      if (!value) {
+        try { value = await navigator.clipboard.readText(); } catch (_) {}
+      }
+      const pasted = panelPasteIntoGame(value);
+      addLog(pasted
+        ? 'Text pasted into game answer field'
+        : 'Paste failed: enter text in the panel and wait for a game answer field',
+      pasted ? 'ok' : 'err');
+    });
+
+    document.getElementById('ln-ac-copy-log').addEventListener('click', async () => {
+      const value = document.getElementById('ln-ac-log')?.innerText || '';
+      try {
+        await navigator.clipboard.writeText(value);
+        addLog('Log copied', 'ok');
+      } catch (_) {
+        addLog('Copy failed: select the log text and copy it normally', 'err');
+      }
+    });
+
     const muteBox = document.getElementById('ln-ac-mute');
-    const fastBox = document.getElementById('ln-ac-fast');
     const fakeMinBox = document.getElementById('ln-ac-fake-min');
     const fakeMaxBox = document.getElementById('ln-ac-fake-max');
     const webhookBox = document.getElementById('ln-ac-webhook');
     const webhookTest = document.getElementById('ln-ac-webhook-test');
+    const humanizeBox = document.getElementById('ln-ac-humanize');
+    if (humanizeBox) {
+      humanizeBox.checked = state.humanize;
+      humanizeBox.onchange = () => {
+        state.humanize = humanizeBox.checked;
+        saveBoolSetting('humanize', state.humanize);
+      };
+    }
+    for (const [id, property, eventName] of [
+      ['ln-ac-accent', 'uiAccent', 'input'], ['ln-ac-scale', 'uiScale', 'input'],
+      ['ln-ac-opacity', 'uiOpacity', 'input'], ['ln-ac-dock', 'uiDock', 'change']
+    ]) {
+      const control = document.getElementById(id);
+      if (!control) continue;
+      control.value = String(state[property]);
+      control.addEventListener(eventName, () => {
+        state[property] = control.value;
+        saveStringSetting(property, state[property]);
+        applyPanelAppearance();
+      });
+    }
+    applyPanelAppearance();
+    refreshPilotTimer();
 
     if (fakeMinBox && fakeMaxBox) {
       fakeMinBox.value = String(state.fakeTimeMin);
@@ -12976,7 +14290,7 @@
         webhookTest.disabled = true;
         const ok = await sendDiscordWebhook(
           'Webhook test',
-          'Connection from LanguageNut Autocompleter v10.5'
+          'Connection from LanguageNut Autocompleter v12.26'
         );
         webhookTest.disabled = false;
 
@@ -12997,16 +14311,33 @@
       });
     }
 
-    if (fastBox) {
-      fastBox.checked = !!state.fastAnimations;
-      fastBox.addEventListener('change', () => {
-        state.fastAnimations = !!fastBox.checked;
-        saveBoolSetting('fastAnimations', state.fastAnimations);
-        applyAnimationSpeed();
-        addLog(
-          `Animations ${state.fastAnimations ? `${CONFIG.fastAnimationSpeed}×` : 'normal'}`,
-          'ok'
-        );
+    const autoBox = document.getElementById('ln-ac-auto');
+    if (autoBox) {
+      autoBox.checked = !!state.autopilot;
+      autoBox.addEventListener('change', () => {
+        if (!autoBox.checked) {
+          state.autopilot = false;
+          saveBoolSetting('autopilot', false);
+          if (state.pilotStartedAt) {
+            state.pilotElapsedMs += Date.now() - state.pilotStartedAt;
+            state.pilotStartedAt = 0;
+            saveStringSetting('pilotElapsedMs', state.pilotElapsedMs);
+          }
+          refreshPilotTimer();
+          addLog('Full auto disabled', 'ok');
+          return;
+        }
+        autoBox.checked = false;
+        showFullAutoWarning(() => {
+          state.autopilot = true;
+          state.pilotBlockedStep = '';
+          state.pilotFinished = false;
+          state.pilotStartedAt = Date.now();
+          saveBoolSetting('autopilot', true);
+          autoBox.checked = true;
+          addLog('Full auto enabled: Dashboard → Homework → task games', 'ok');
+          if (!state.running) toggleRunning();
+        });
       });
     }
 
@@ -13075,18 +14406,11 @@
       }
 
       if (state.mode === 'mc2-listening') {
-        const audio = mc2FindAudioButton();
-
-        if (!audio) {
-          addLog('No MC2 sound button', 'err');
-          return;
-        }
-
-        const b = audio.bounds;
-        const x = b.x + b.width / 2;
-        const y = b.y + b.height / 2;
-
-        safeCanvasPointerClickWorld(x, y, '#4ade80', 15);
+        mc2PlayListeningAudio().catch(error => {
+          const message = error && error.message ? error.message : String(error);
+          addLog(`MC2 audio error: ${message}`, 'err');
+          setStatus('MC2 Listening: audio click failed');
+        });
         return;
       }
 
@@ -13139,6 +14463,11 @@
       while (state.fakeTimeLoggedCount < activityCount) {
         const seconds = fakeTimeSample(state.fakeTimeLoggedCount);
         state.fakeTimeLoggedCount++;
+        if (state.autopilot) {
+          state.pilotFakeSeconds += seconds;
+          saveStringSetting('pilotFakeSeconds', state.pilotFakeSeconds);
+          refreshPilotTimer();
+        }
         addLog(`Question ${state.fakeTimeLoggedCount}: simulated ${seconds}s`, 'ok');
       }
     }
@@ -13152,12 +14481,50 @@
     }
   }
   function setProgress(n,t){const f=document.getElementById('ln-ac-fill'),c=document.getElementById('ln-ac-count');if(c)c.textContent=t?`${n}/${t}`:String(n);if(f)f.style.width=t?Math.min(100,n/t*100)+'%':'0%';}
-  function addLog(m,c){const e=document.getElementById('ln-ac-log');if(!e)return;const l=document.createElement('div');l.textContent=m;if(c)l.className=c;e.appendChild(l);e.scrollTop=e.scrollHeight;while(e.children.length>120)e.removeChild(e.firstChild);}
+  function showToast(message, kind) {
+    if (!document.body) return;
+    let stack = document.getElementById('ln-ac-toasts');
+    if (!stack) {
+      stack = document.createElement('div');
+      stack.id = 'ln-ac-toasts';
+      document.body.appendChild(stack);
+    }
+    const item = document.createElement('div');
+    item.className = `ln-ac-toast ${kind || 'ok'}`;
+    const label = document.createElement('span');
+    label.textContent = String(message);
+    const close = document.createElement('button');
+    close.type = 'button'; close.textContent = '×'; close.setAttribute('aria-label', 'Close notification');
+    close.onclick = () => item.remove();
+    item.append(label, close); stack.appendChild(item);
+    setTimeout(() => item.remove(), kind === 'err' ? 12000 : 5000);
+  }
+  function addLog(m,c){
+    let errorKey = '';
+    if(c==='err' && !/^Discord webhook/i.test(String(m))) {
+      errorKey = `${state.mode || pilotRoute()}:${String(m).replace(/\b\d+\b/g, '#').slice(0, 150)}`;
+      const now = Date.now();
+      if(now - (state.errorLastLogAt.get(errorKey) || 0) < 1000) return;
+      state.errorLastLogAt.set(errorKey, now);
+    }
+    const e=document.getElementById('ln-ac-log');
+    if(e){const l=document.createElement('div');l.textContent=m;if(c)l.className=c;e.appendChild(l);e.scrollTop=e.scrollHeight;while(e.children.length>120)e.removeChild(e.firstChild);}
+    if(errorKey) {
+      const count = (state.pilotErrorCounts.get(errorKey) || 0) + 1;
+      state.pilotErrorCounts.set(errorKey, count);
+      if(count===11){
+        const notice = `Repeated error (${count}×): ${String(m).slice(0, 180)}`;
+        showToast(notice, 'err');
+        if(validDiscordWebhook(state.discordWebhook)) notifyDiscord('Repeated error', notice);
+      }
+    }
+  }
   function toggleRunning(){
     state.running = !state.running;
     const b = document.getElementById('ln-ac-toggle');
 
     if (state.running) {
+      if (state.autopilot && !state.pilotStartedAt) state.pilotStartedAt = Date.now();
       resetFakeTimeActivity();
       hookServicesFakeTime();
       state.completionSeen = null;
@@ -13204,6 +14571,12 @@
         });
       }
     } else {
+      if (state.pilotStartedAt) {
+        state.pilotElapsedMs += Date.now() - state.pilotStartedAt;
+        state.pilotStartedAt = 0;
+        saveStringSetting('pilotElapsedMs', state.pilotElapsedMs);
+        refreshPilotTimer();
+      }
       raceDriverBoost(false);
       b.textContent = 'Start';
       b.classList.remove('active');
@@ -13229,7 +14602,6 @@
     addLog('Vocab: ' + state.vocab.length + ', Sentences: ' + state.sentences.length + ', Verbs: ' + state.verbs.length);
     addLog(
       `Options: mute=${state.muteAudio ? 'on' : 'off'}, ` +
-      `fastAnimations=${state.fastAnimations ? `${CONFIG.fastAnimationSpeed}x` : 'off'}, ` +
       `discordWebhook=${validDiscordWebhook(state.discordWebhook) ? 'configured' : 'off'}`
     );
 
@@ -13249,6 +14621,10 @@
         wpTextures.slice(0, 30).forEach(x => addLog('  ' + x));
       }
     }
+    addLog(
+      `Full auto=${state.autopilot ? 'on' : 'off'}, ` +
+      `homework=${state.pilotHomeworkUid || '—'}, task=${state.pilotTaskIndex + 1}`
+    );
     if (liveMode === 'jumble') {
       addLog('Target: ' + (state.targetWord || '—'));
       addLog('Target key: ' + (state.targetLetters || '—'));
@@ -13854,9 +15230,18 @@
       });
     }
     addLog('Completion check: ' + (detectCompletion() || 'no'));
-  }
-  function boot() {
+  }  function boot() {
     concertInstallGlobalCanvasBlocker();
-    concertInstallGlobalNavigationLock(); applyAudioMute(); if (!createPanel()) { const obs = new MutationObserver(() => { if (createPanel()) obs.disconnect(); }); obs.observe(document.documentElement || document, { childList: true, subtree: true }); setTimeout(createPanel, 1000); setTimeout(createPanel, 3000); } tryGrabPixi(); setTimeout(tryGrabPixi, 800); setTimeout(tryGrabPixi, 2500); }
+    concertInstallGlobalNavigationLock(); applyAudioMute(); if (!createPanel()) { const obs = new MutationObserver(() => { if (createPanel()) obs.disconnect(); }); obs.observe(document.documentElement || document, { childList: true, subtree: true }); setTimeout(createPanel, 1000); setTimeout(createPanel, 3000); } tryGrabPixi(); setTimeout(tryGrabPixi, 800); setTimeout(tryGrabPixi, 2500);
+    window.addEventListener('beforeunload', () => {
+      if (state.pilotStartedAt) {
+        state.pilotElapsedMs += Date.now() - state.pilotStartedAt;
+        state.pilotStartedAt = 0;
+        saveStringSetting('pilotElapsedMs', state.pilotElapsedMs);
+      }
+    });
+    setTimeout(() => showToast('Autocompleter successfully loaded!', 'ok'), 150);
+    if (state.autopilot) setTimeout(() => { if (!state.running) toggleRunning(); }, 350);
+  }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot); else boot();
 })();
