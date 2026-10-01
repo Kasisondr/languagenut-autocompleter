@@ -7,9 +7,10 @@ It does not use any AI to fetch answers—it relies directly on API calls. This 
 ---
 
 ## Features
-* Automation
+* Full Auto
 * Fake Time
 * Webhook Support
+* Humanize Text(For stuff that is teacher-marked)
 
 ## Supported Games
 * Jumble
@@ -26,9 +27,9 @@ It does not use any AI to fetch answers—it relies directly on API calls. This 
 * Ocean Cleaner
 * Skyrise
 * Concert Speaking
-* Avocado Smash (Some parts)
+* Avocado Smash
 * Code Breaker
-* Blast Off (I think)
+* Blast Off
 * Matching Pairs
 * Exams
 * Dictation
@@ -39,9 +40,7 @@ It does not use any AI to fetch answers—it relies directly on API calls. This 
 
 ## Working On
 
-* Phonics Imposter
-* Phonics Catapult
-* Other Stuff
+* Other stuff that i dont have on my homework
 
 ---
 
