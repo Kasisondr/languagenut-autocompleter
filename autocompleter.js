@@ -2,7 +2,7 @@
 // @name         LanguageNut Autocompleter
 // @namespace    languagenut-autocompleter
 // @version      12.26
-// @description  Autocompletes LanguageNut vocab/sentence activities including WordPod, Skyrise and Concert Speaking
+// @description  Autocompletes LanguageNut Homework
 // @author       You
 // @match        *://*.languagenut.com/*
 // @match        *://languagenut.com/*
