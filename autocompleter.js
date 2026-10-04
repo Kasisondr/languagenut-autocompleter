@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         LanguageNut Autocompleter (Jumble + MC + Fridge)
+// @name         LanguageNut Autocompleter
 // @namespace    languagenut-autocompleter
 // @version      12.26
 // @description  Autocompletes LanguageNut vocab/sentence activities including WordPod, Skyrise and Concert Speaking
